@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections import OrderedDict
 
+import torch
 import comfy.lora
 import comfy.patcher_extension
 import comfy.utils
@@ -34,6 +36,7 @@ class StackReport:
         self.merged = 0
         self.branched = 0
         self.skipped = 0
+        self.rejected = 0
         self.bank_bytes = 0
 
     def add(self, line: str):
@@ -125,8 +128,7 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
     video_dim = int(getattr(diffusion_model.final_layer.video_out, "out_features", 0) or 0)
     audio_dim = int(getattr(diffusion_model.final_layer.audio_out, "out_features", 0) or 0)
     hidden = int(getattr(diffusion_model, "hidden_size", 0) or 0)
-    pdd_bank = None
-    pdd_from = None
+    pdd_entry = None
     target_dim, table = adaln_mod.read_target(diffusion_model)
     if adaln_mode == "off":
         adaln_ctx = None
@@ -166,15 +168,32 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
     for fallback_row, entry in enumerate(entries, start=1):
         row_index = int(entry.get("row", fallback_row))
         name = entry.get("name") or entry["path"]
-        strength = float(entry.get("strength", 1.0))
+        try:
+            strength = float(entry.get("strength", 1.0))
+        except (TypeError, ValueError):
+            report.rejected += 1
+            report.add(f"{name} rejected: strength must be numeric")
+            continue
+        if not math.isfinite(strength):
+            report.rejected += 1
+            report.add(f"{name} rejected: strength must be finite")
+            continue
         row_schedule = schedule_mod.resolve(schedule, row_index)
-        lora_sd = comfy.utils.load_torch_file(entry["path"], safe_load=True)
+        try:
+            lora_sd = comfy.utils.load_torch_file(entry["path"], safe_load=True)
+        except Exception as exc:
+            report.rejected += 1
+            report.add(f"{name} rejected: could not load LoRA ({exc})")
+            continue
 
         normalized, unmatched = keymap.normalize(lora_sd, index)
         bank, pdd_note = pdd_mod.peel(normalized, video_dim, audio_dim, hidden)
-        if bank is not None:
-            pdd_bank = bank
-            pdd_from = name
+        row_pdd_entry = ({
+            "bank": bank,
+            "name": name,
+            "strength": strength,
+            "schedule": row_schedule,
+        } if bank is not None else None)
         measured = gain.measure_state_dict(normalized, name)
 
         # before porting: the port derives its bias delta as ``B @ const``, so
@@ -183,8 +202,9 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             normalized, mod_values, mod_geom)
         mod_note = modality_mod.describe(mod_values, mod_stats)
         adaln_note = ""
+        table_key = next((key for key in normalized if key.endswith("adaln_t_table")), None)
+        source_table = normalized.pop(table_key) if table_key is not None else None
         if adaln_ctx is not None and target_dim:
-            source_table = normalized.pop("adaln_t_table", None)
             normalized, stats = adaln_mod.port_adaln_pairs(
                 normalized, adaln_ctx, source_table=source_table)
             if stats["ported"]:
@@ -196,10 +216,58 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             if stats["residual"] is not None:
                 adaln_note += f" (basis fit {stats['residual']:.1e})"
 
-        loaded = comfy.lora.load_lora(normalized, key_map)
+        passengers = [key for key in normalized if keymap.split_suffix(key)[1] is None]
+        unsupported_passengers = [key for key in passengers
+                                  if not key.endswith("adaln_t_table")]
+        if unsupported_passengers:
+            report.rejected += len(unsupported_passengers)
+            example = ", ".join(unsupported_passengers[:2])
+            if len(unsupported_passengers) > 2:
+                example += ", ..."
+            report.add(f"{name} rejected: {len(unsupported_passengers)} unsupported "
+                       f"passenger tensor(s) ({example}); no partial application")
+            continue
+        if row_pdd_entry is not None:
+            pdd_entry = row_pdd_entry
+        try:
+            loaded = comfy.lora.load_lora(normalized, key_map)
+        except Exception as exc:
+            report.rejected += 1
+            report.add(f"{name} rejected: adapter load failed ({exc})")
+            continue
 
         merge: dict = dict(loaded)
         branched_here = 0
+        skipped_here = 0
+        branch_rejected_here = 0
+        for weight_key, patch in loaded.items():
+            if (not weight_key.endswith(".weight") or not isinstance(patch, tuple)
+                    or len(patch) <= 1 or patch[0] not in {"diff", "set"}
+                    or not patch[1]):
+                continue
+            candidate = patch[1][0]
+            module_path = weight_key[:-len(".weight")]
+            weight = _module_weight(patcher, module_path)
+            if (not torch.is_tensor(candidate) or weight is None
+                    or tuple(candidate.shape) != tuple(weight.shape)):
+                LOG.warning("H3 PowerLoraStack: shape mismatch on %s, skipped", weight_key)
+                report.skipped += 1
+                skipped_here += 1
+                merge.pop(weight_key, None)
+        for bias_key, bias_patch in loaded.items():
+            if (not bias_key.endswith(".bias") or not isinstance(bias_patch, tuple)
+                    or len(bias_patch) <= 1 or bias_patch[0] != "diff"
+                    or not bias_patch[1]):
+                continue
+            module_path = bias_key[:-len(".bias")]
+            candidate = bias_patch[1][0]
+            weight = _module_weight(patcher, module_path)
+            if (not torch.is_tensor(candidate) or weight is None
+                    or candidate.ndim != 1 or candidate.shape[0] != weight.shape[0]):
+                LOG.warning("H3 PowerLoraStack: shape mismatch on %s, skipped", bias_key)
+                report.skipped += 1
+                skipped_here += 1
+                merge.pop(bias_key, None)
         for weight_key, adapter in loaded.items():
             if not weight_key.endswith(".weight"):
                 continue
@@ -207,29 +275,33 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             if module_path is None or not _is_plain_lora(adapter):
                 continue
             weight = _module_weight(patcher, module_path)
-            effective_mode = "branch" if row_schedule is not None else mode
-            if not _branchable(weight, module_path, effective_mode):
-                continue
             up, down = adapter.weights[0], adapter.weights[1]
-            if up.shape[0] != weight.shape[0] or down.shape[1] != weight.shape[1]:
+            if (not torch.is_tensor(up) or not torch.is_tensor(down)
+                    or up.ndim != 2 or down.ndim != 2 or up.shape[1] != down.shape[0]
+                    or weight is None or up.shape[0] != weight.shape[0]
+                    or down.shape[1] != weight.shape[1]):
                 LOG.warning("H3 PowerLoraStack: shape mismatch on %s, skipped", weight_key)
                 report.skipped += 1
+                skipped_here += 1
                 merge.pop(weight_key, None)
+                continue
+            effective_mode = "branch" if row_schedule is not None else mode
+            if not _branchable(weight, module_path, effective_mode):
                 continue
             alpha = adapter.weights[2]
             alpha_scale = float(alpha) / down.shape[0] if alpha is not None else 1.0
             bias = None
-            if row_schedule is not None:
-                bias_key = f"{module_path}.bias"
-                bias_patch = loaded.get(bias_key)
-                if (isinstance(bias_patch, tuple) and len(bias_patch) > 1
-                        and bias_patch[0] == "diff" and bias_patch[1]):
-                    candidate = bias_patch[1][0]
-                    if getattr(candidate, "ndim", None) == 1 and candidate.shape[0] == weight.shape[0]:
-                        bias = candidate
-                        merge.pop(bias_key, None)
+            bias_key = f"{module_path}.bias"
+            bias_patch = loaded.get(bias_key)
+            if (isinstance(bias_patch, tuple) and len(bias_patch) > 1
+                    and bias_patch[0] == "diff" and bias_patch[1]):
+                candidate = bias_patch[1][0]
+                if getattr(candidate, "ndim", None) == 1 and candidate.shape[0] == weight.shape[0]:
+                    bias = candidate.to(torch.float32) * strength
+                    merge.pop(bias_key, None)
+            if row_schedule is not None or bias is not None:
                 per_module.setdefault(module_path, []).append(
-                    (up, down, alpha_scale, row_schedule, bias))
+                    (up, down, strength * alpha_scale, row_schedule, bias))
             else:
                 # Preserve the original strength-folded contribution exactly.
                 per_module.setdefault(module_path, []).append(
@@ -237,17 +309,46 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             merge.pop(weight_key, None)
             branched_here += 1
 
-        if merge:
-            patcher.add_patches(merge, strength)
-        report.merged += len(merge)
+        if mode == "branch" and merge:
+            # Branch mode must not silently fall back to a weight patch for an
+            # adapter or passenger that has no runtime branch implementation.
+            branch_rejected_here = len(merge)
+            report.rejected += branch_rejected_here
+            merge.clear()
+
+        accepted = patcher.add_patches(merge, strength) if merge else []
+        rejected_here = len(merge) - len(accepted)
+        quantized_merge = []
+        for patch_key in accepted:
+            weight_key = patch_key[0] if isinstance(patch_key, tuple) else patch_key
+            if not isinstance(weight_key, str) or not weight_key.endswith(".weight"):
+                continue
+            module_path = weight_key[:-len(".weight")]
+            if isinstance(_module_weight(patcher, module_path), QuantizedTensor):
+                quantized_merge.append(weight_key)
+        report.rejected += rejected_here
+        report.merged += len(accepted)
         report.branched += branched_here
 
-        detail = f"{len(merge)} merged, {branched_here} branched"
+        detail = f"{len(accepted)} merged, {branched_here} branched"
         if unmatched:
             detail += f", {len(unmatched)} unmatched"
+        if passengers:
+            detail += f", {len(passengers)} ignored"
+        if skipped_here:
+            detail += f", {skipped_here} skipped"
+        if rejected_here:
+            detail += f", {rejected_here} rejected"
+        if branch_rejected_here:
+            detail += f", {branch_rejected_here} rejected in branch mode"
+        if quantized_merge:
+            detail += f", {len(quantized_merge)} quantized merge"
         if pdd_note:
             detail += f", {pdd_note}"
         report.add(f"{name} @ {strength:g}: {detail}{adaln_note}{mod_note}")
+        if quantized_merge:
+            report.add("  ! quantized targets were merged because no exact runtime "
+                       "adapter path was available")
         if row_schedule is not None:
             arrow = "\u2192"
             report.add(
@@ -256,20 +357,21 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
                 f"({row_schedule.domain} {row_schedule.start_percent:g}\u2013"
                 f"{row_schedule.end_percent:g}%)"
             )
-            if merge:
+            if accepted:
                 report.add(
-                    f"  ! {len(merge)} patches on {name} cannot be scheduled "
+                    f"  ! {len(accepted)} patches on {name} cannot be scheduled "
                     f"(merged at {strength:.2f})"
                 )
         if measured.get("rel"):
             # what this LoRA actually does to the weights, so a strength that is
             # far off the calibrated unit is visible without the UI button
             note = f"  rel dW {measured['rel'] * 100:.3f}%"
-            suggested = measured["factor"]
-            if abs(strength - suggested) > 0.1 * max(suggested, 1e-6):
-                note += f" (auto-balance would use {suggested:.2f})"
+            factor = measured["factor"]
+            suggested = strength * factor
+            if abs(strength - suggested) > 0.1 * max(abs(suggested), 1e-6):
+                note += f" (auto-balance would use {suggested:.2f}, factor {factor:.2f})"
             report.add(note)
-        if not merge and not branched_here:
+        if not accepted and not branched_here and row_pdd_entry is None:
             report.add(f"  ! {name} matched no layers on this model")
 
     if per_module:
@@ -289,9 +391,11 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         report.add(f"branch bank: {len(per_module)} layers, "
                    f"{report.bank_bytes / (1024 ** 2):.0f} MB")
 
-    if pdd_bank is not None:
-        pdd_mod.attach(patcher, pdd_bank)
-        report.add(f"PDD: {pdd_bank['n']} heads from {pdd_from} "
-                   f"(simple @ 8 steps, shifts 12/3)")
+    if pdd_entry is not None:
+        pdd_bank = pdd_entry["bank"]
+        pdd_mod.attach(patcher, pdd_bank, pdd_entry["strength"], pdd_entry["schedule"])
+        report.add(f"PDD: {pdd_bank['n']} heads from {pdd_entry['name']} "
+                   f"(strength {pdd_entry['strength']:g}, "
+                   f"{pdd_mod.bank_bytes(pdd_bank) / (1024 ** 2):.0f} MB, shifts 12/3)")
 
     return patcher, report

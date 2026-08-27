@@ -47,6 +47,8 @@ def measure_names(names):
             entry["note"] = "unreadable"
         elif not info.get("rel"):
             entry["note"] = "no measurable layers"
+        elif not info.get("complete", True):
+            entry["note"] = "calibration is partial for unsupported adapter tensors"
         else:
             fp = info.get("fingerprint")
             first = seen.get(fp) if fp else None

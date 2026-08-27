@@ -24,6 +24,9 @@ import re
 # suffixes comfy.lora.load_lora understands, longest first so that
 # ``.lora_down.weight`` is not truncated to ``.weight``
 _LORA_SUFFIXES = (
+    ".lora_linear_layer.down.weight", ".lora_linear_layer.up.weight",
+    "_lora.down.weight", "_lora.up.weight",
+    ".lora.down.weight", ".lora.up.weight",
     ".lora_down.weight", ".lora_up.weight",
     ".lora_A.weight", ".lora_B.weight",
     ".lora_A.default.weight", ".lora_B.default.weight",
@@ -32,7 +35,8 @@ _LORA_SUFFIXES = (
     ".diff_b", ".diff", ".set_weight", ".alpha",
     ".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b", ".hada_t1", ".hada_t2",
     ".lokr_w1", ".lokr_w2", ".lokr_w1_a", ".lokr_w1_b", ".lokr_w2_a", ".lokr_w2_b",
-    ".lokr_t2", ".oft_blocks", ".boft_blocks", ".rescale", ".w_norm", ".b_norm",
+    ".lokr_t2", ".reshape_weight", ".oft_blocks", ".boft_blocks", ".rescale",
+    ".w_norm", ".b_norm",
 )
 
 _STRIP_PREFIXES = (

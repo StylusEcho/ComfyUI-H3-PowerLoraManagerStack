@@ -61,7 +61,7 @@ TE_OUT_B = "time_embedder.proj_out.bias"
 MAX_RESIDUAL = 5e-3
 FREQ_DIM = 256
 
-_grid_cache: dict[str, torch.Tensor] = {}
+_grid_cache: dict[tuple[str, int, int], torch.Tensor] = {}
 _basis_cache: dict[tuple, tuple] = {}
 
 
@@ -96,8 +96,10 @@ def find_silu_grid(extra_dirs=()) -> str:
 
 
 def load_silu_grid(path: str) -> torch.Tensor:
-    """Load the ``[grid, 2688]`` silu(t_emb) grid, cached by path."""
-    cached = _grid_cache.get(path)
+    """Load the ``[grid, 2688]`` silu(t_emb) grid, cached by file version."""
+    stat = os.stat(path)
+    cache_key = (path, stat.st_mtime_ns, stat.st_size)
+    cached = _grid_cache.get(cache_key)
     if cached is not None:
         return cached
     from safetensors.torch import load_file
@@ -105,7 +107,10 @@ def load_silu_grid(path: str) -> torch.Tensor:
     if _GRID_TENSOR not in sd:
         raise ValueError(f"{path} does not contain '{_GRID_TENSOR}'")
     grid = sd[_GRID_TENSOR].to(torch.float32)
-    _grid_cache[path] = grid
+    for old_key in tuple(_grid_cache):
+        if old_key[0] == path and old_key != cache_key:
+            _grid_cache.pop(old_key, None)
+    _grid_cache[cache_key] = grid
     return grid
 
 
@@ -123,9 +128,11 @@ def tensor_hash(tensor):
 
 def silu_temb_grid(proj_in_w, proj_in_b, proj_out_w, proj_out_b,
                    rows=1025, freq_dim=FREQ_DIM):
-    t = torch.arange(rows, dtype=torch.float32) / float(rows - 1)
+    device = proj_in_w.device
+    t = torch.arange(rows, device=device, dtype=torch.float32) / float(rows - 1)
     half = freq_dim // 2
-    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32) / half)
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(
+        half, device=device, dtype=torch.float32) / half)
     args = t[:, None] * freqs[None]
     emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     hidden = F.silu(emb @ proj_in_w.float().T + proj_in_b.float())
@@ -262,13 +269,15 @@ def fit_basis(table: torch.Tensor, grid: torch.Tensor):
             f"adaLN table grid ({table.shape[0]}) and silu grid ({grid.shape[0]}) "
             "have different resolutions; they must come from the same bake"
         )
-    key = (id(table), table.shape, float(table.float().sum()), id(grid))
+    table_cpu = _cpu_f32(table)
+    grid_cpu = _cpu_f32(grid)
+    key = (tensor_hash(table_cpu), tensor_hash(grid_cpu))
     cached = _basis_cache.get(key)
     if cached is not None:
         return cached
 
-    t = table.to(torch.float64)
-    s = grid.to(torch.float64)
+    t = table_cpu.to(torch.float64)
+    s = grid_cpu.to(torch.float64)
     design = torch.cat([torch.ones(t.shape[0], 1, dtype=torch.float64), t], dim=1)  # [G, 1+k]
     solution = torch.linalg.lstsq(design, s).solution                                # [1+k, 2688]
     c = solution[0].contiguous()                                                     # [2688]
@@ -310,8 +319,8 @@ def fit_table_to_table(source_table: torch.Tensor, target_table: torch.Tensor):
 
     Returns ``(M [k_src, k_tgt], a [k_src], residual)``.
     """
-    src = source_table.to(torch.float64)
-    tgt = target_table.to(torch.float64)
+    src = _cpu_f32(source_table).to(torch.float64)
+    tgt = _cpu_f32(target_table).to(torch.float64)
     if src.shape[0] != tgt.shape[0]:
         raise ValueError(
             f"adaLN tables have different grid resolutions ({src.shape[0]} vs {tgt.shape[0]})"
@@ -363,23 +372,22 @@ class AdalnContext:
 
     def _scan_grids(self, table):
         rows = int(table.shape[0])
-        key = tensor_hash(table)
-        cached = _read_basis_cache(key)
-        if cached is not None and _accept(cached[2]):
-            v, c, residual, source = cached
-            return self._record(v, c, residual, "%s (cached)" % source)
+        table_key = tensor_hash(table)
         best = None
         for label, path in _iter_diffusion_safetensors():
             grid = _grid_from_checkpoint(path, rows)
             if grid is None:
                 continue
-            v, c, residual = fit_basis(table.detach().to("cpu"), grid)
+            key = "d%s%s" % (table_key[:8], tensor_hash(grid)[:8])
+            cached = _read_basis_cache(key)
+            if cached is not None:
+                v, c, residual, _src = cached
+            else:
+                v, c, residual = fit_basis(table.detach().to("cpu"), grid)
+                _write_basis_cache(key, v, c, residual, label)
             if best is None or residual < best[2]:
                 best = (v, c, residual, label)
-        if best is not None:
-            _write_basis_cache(key, best[0], best[1], best[2], best[3])
-            return self._record(*best)
-        return None
+        return self._record(*best) if best is not None else None
 
     def _scan_tables(self, grid):
         grid_key = tensor_hash(grid)
@@ -388,7 +396,7 @@ class AdalnContext:
             table = _table_from_checkpoint(path)
             if table is None or table.shape[0] != grid.shape[0]:
                 continue
-            key = "d%s%s" % (grid_key[:8], tensor_hash(table)[:8])
+            key = "d%s%s" % (tensor_hash(table)[:8], grid_key[:8])
             cached = _read_basis_cache(key)
             if cached is not None:
                 v, c, residual, _src = cached
@@ -404,7 +412,7 @@ class AdalnContext:
     def basis(self, curve_table=None):
         """``(V, c, residual)`` relating the dense space to a curve basis."""
         table = self.table if self.table is not None else curve_table
-        cache_key = None if table is None else id(table)
+        cache_key = None if table is None else tensor_hash(table)
         if table is not self.table and cache_key in self._curve_cache:
             return self._curve_cache[cache_key]
         if self.table is not None and (self._basis is not None or self._failed):
@@ -481,36 +489,55 @@ def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None):
 
     # curve -> curve via the LoRA's own table, when it carries one
     table_map = None
+    table_map_failed = source_table is not None and ctx.table is not None
     if source_table is not None and ctx.table is not None:
         try:
             m, a_const, residual = fit_table_to_table(source_table, ctx.table)
-            table_map = (m, a_const)
-            stats["residual"] = residual
-            LOG.info("H3 PowerLoraStack: adaLN table-to-table fit residual %.2e", residual)
+            if _accept(residual):
+                table_map = (m, a_const)
+                stats["residual"] = residual
+                table_map_failed = False
+                LOG.info("H3 PowerLoraStack: adaLN table-to-table fit residual %.2e", residual)
+            else:
+                LOG.warning("H3 PowerLoraStack: adaLN table-to-table fit residual %.2e exceeds %.0e",
+                            residual, MAX_RESIDUAL)
         except Exception as exc:
             LOG.warning("H3 PowerLoraStack: adaLN table rebase unavailable (%s)", exc)
 
     out = dict(sd)
     basis = None
+    basis_pinv = None
     for module, parts in modules.items():
-        a_key = parts.get("lora_A.weight") or parts.get("lora_down.weight")
-        b_key = parts.get("lora_B.weight") or parts.get("lora_up.weight")
+        a_key = next((parts.get(suffix) for suffix in (
+            "lora_A.weight", "lora_A.default.weight", "lora_A",
+            "lora_down.weight", "_lora.down.weight", "lora.down.weight",
+            "lora_linear_layer.down.weight",
+        ) if parts.get(suffix)), None)
+        b_key = next((parts.get(suffix) for suffix in (
+            "lora_B.weight", "lora_B.default.weight", "lora_B",
+            "lora_up.weight", "_lora.up.weight", "lora.up.weight",
+            "lora_linear_layer.up.weight",
+        ) if parts.get(suffix)), None)
         if a_key is None or b_key is None:
             continue
         a = sd[a_key]
-        if a.ndim != 2:
+        b = sd[b_key]
+        if a.ndim != 2 or b.ndim != 2 or b.shape[1] != a.shape[0]:
+            LOG.warning("H3 PowerLoraStack: malformed adaLN pair %s, skipped", module)
+            for key in parts.values():
+                out.pop(key, None)
+            stats["skipped"] += 1
             continue
         source_dim = a.shape[1]
-        b = sd[b_key]
         a32 = a.to(torch.float32)
 
         if table_map is not None and source_dim == table_map[0].shape[0]:
-            m, a_const = table_map
+            m, a_const = (x.to(device=a32.device) for x in table_map)
             a_new = a32 @ m                            # [r, k_tgt]
             const = a32 @ a_const                      # [r]
             sign = 1.0
             kind = "rebased"
-        elif source_dim == ctx.target_dim:
+        elif source_dim == ctx.target_dim and not table_map_failed:
             stats["ok"] += 1
             continue
         else:
@@ -522,13 +549,17 @@ def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None):
                 stats["skipped"] += 1
                 continue
             v, c, residual = basis                     # V: [2688, k], c: [2688]
+            v = v.to(device=a32.device)
+            c = c.to(device=a32.device)
             stats["residual"] = residual
             if source_dim == v.shape[0] and ctx.target_dim == v.shape[1]:
                 a_new = a32 @ v                        # [r, k]
                 const = a32 @ c                        # [r]
                 sign = 1.0
             elif source_dim == v.shape[1] and ctx.target_dim == v.shape[0]:
-                a_new = a32 @ torch.linalg.pinv(v)     # [r, 2688]
+                if basis_pinv is None:
+                    basis_pinv = torch.linalg.pinv(v)
+                a_new = a32 @ basis_pinv                # [r, 2688]
                 const = a_new @ c                      # [r]
                 sign = -1.0
             else:

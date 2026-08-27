@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 import folder_paths
 
@@ -54,14 +55,22 @@ def _resolve_lora(name: str):
     if path:
         return path
     wanted = name.replace("\\", "/").lower()
+    matches = []
     for candidate in folder_paths.get_filename_list("loras"):
         normalized = candidate.replace("\\", "/").lower()
-        if normalized == wanted or normalized.endswith("/" + wanted.rsplit("/", 1)[-1]):
-            return folder_paths.get_full_path("loras", candidate)
+        if normalized == wanted:
+            matches.append(candidate)
+        elif "/" not in wanted and normalized.endswith("/" + wanted):
+            matches.append(candidate)
+    if len(matches) == 1:
+        return folder_paths.get_full_path("loras", matches[0])
+    if len(matches) > 1:
+        LOG.warning("H3 Power LoRA Stack: ambiguous lora name %r (%d matches)",
+                    name, len(matches))
     return None
 
 
-def _collect(kwargs):
+def _collect(kwargs, issues=None):
     """Pull enabled rows out of the dynamic ``lora_N`` inputs, in UI order."""
     rows = []
     for key, value in kwargs.items():
@@ -80,7 +89,20 @@ def _collect(kwargs):
     for order, value in rows:
         if not value.get("on", True):
             continue
-        strength = float(value.get("strength", 1.0))
+        try:
+            strength = float(value.get("strength", 1.0))
+        except (TypeError, ValueError):
+            message = f"row {order}: strength is not numeric"
+            LOG.warning("H3 Power LoRA Stack: %s", message)
+            if issues is not None:
+                issues.append(message)
+            continue
+        if not math.isfinite(strength):
+            message = f"row {order}: strength must be finite"
+            LOG.warning("H3 Power LoRA Stack: %s", message)
+            if issues is not None:
+                issues.append(message)
+            continue
         if strength == 0.0:
             continue
         name = value.get("lora")
@@ -88,7 +110,10 @@ def _collect(kwargs):
             continue        # a row the user added but has not filled in yet
         path = _resolve_lora(name)
         if path is None:
-            LOG.warning("H3 Power LoRA Stack: could not find lora %r, skipping", name)
+            message = f"row {order}: could not resolve lora {name!r}"
+            LOG.warning("H3 Power LoRA Stack: %s", message)
+            if issues is not None:
+                issues.append(message)
             continue
         entries.append({"name": name, "path": path, "strength": strength, "row": order})
     return entries
@@ -151,9 +176,10 @@ class H3PowerLoraStack:
         if model is None:
             raise ValueError("H3 Power LoRA Stack: no model connected")
 
-        entries = _collect(kwargs)
+        issues = []
+        entries = _collect(kwargs, issues)
         if not entries:
-            return (model, "no LoRAs enabled")
+            return (model, "no LoRAs enabled" + ("\n" + "\n".join(issues) if issues else ""))
 
         patcher, report = apply_mod.apply_stack(
             model, entries, mode=quantized_layers, adaln_mode=adaln_port,

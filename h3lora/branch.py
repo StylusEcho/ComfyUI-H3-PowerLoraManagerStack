@@ -160,7 +160,8 @@ class ScheduleController:
             ])
             if fused.biases:
                 bias_scales[name] = torch.tensor(
-                    [strength(schedule) for _bias, schedule in fused.biases],
+                    [strength(schedule) if schedule is not None else 1.0
+                     for _bias, schedule in fused.biases],
                     dtype=self.dtype,
                     device=device,
                 )

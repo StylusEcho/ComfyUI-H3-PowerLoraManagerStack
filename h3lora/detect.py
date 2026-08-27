@@ -24,7 +24,12 @@ _CONVENTIONS = (
 
 def read_header(path: str) -> dict:
     with open(path, "rb") as f:
-        length = struct.unpack("<Q", f.read(8))[0]
+        raw_length = f.read(8)
+        if len(raw_length) != 8:
+            raise ValueError("truncated safetensors header length")
+        length = struct.unpack("<Q", raw_length)[0]
+        if length > 64 * 1024 * 1024:
+            raise ValueError("safetensors header exceeds 64 MiB")
         return json.loads(f.read(length))
 
 
@@ -79,7 +84,11 @@ def inspect(path: str) -> dict:
             has_alpha = True
             continue
         shape = v.get("shape") or []
-        is_down = k.endswith(("lora_A.weight", "lora_down.weight"))
+        is_down = k.endswith((
+            "lora_A.weight", "lora_A.default.weight", "lora_A",
+            "lora_down.weight", "_lora.down.weight", ".lora.down.weight",
+            "lora_linear_layer.down.weight",
+        ))
         if is_down and len(shape) == 2:
             ranks.add(int(shape[0]))
             if "adaln" in k:
@@ -97,7 +106,7 @@ def inspect(path: str) -> dict:
     info["modules"] = sorted(modules)
     info["passenger"] = sorted(
         k for k in keys
-        if not re.search(r"(lora_A|lora_B|lora_down|lora_up|alpha|diff|dora|hada|lokr|oft)", k)
+        if not re.search(r"(lora_A|lora_B|lora_down|lora_up|_lora|lora_linear_layer|reshape_weight|alpha|diff|dora|hada|lokr|oft)", k)
     )[:8]
     pdd_n = 0
     for k, v in header.items():

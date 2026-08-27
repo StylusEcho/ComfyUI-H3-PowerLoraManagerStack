@@ -41,6 +41,7 @@ not everything it eventually reaches.
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
 
@@ -51,7 +52,11 @@ TAGS = ("video", "text", "audio")
 
 # lora_B spellings; ``.diff`` is a full-weight replacement, which slices the same
 # way.  ``.set_weight`` is an absolute value, not a delta, so it is never scaled.
-_ROW_KEYS = (".lora_B.weight", ".lora_up.weight", ".diff")
+_ROW_KEYS = (
+    ".lora_B.weight", ".lora_B.default.weight", ".lora_B",
+    ".lora_up.weight", "_lora.up.weight", ".lora.up.weight",
+    ".lora_linear_layer.up.weight", ".diff", ".diff_b",
+)
 
 _ADALN_SUFFIX = "adaln_proj.linear"
 
@@ -91,6 +96,8 @@ def normalize_scales(scales) -> tuple:
         values = tuple(float(v) for v in scales)
     if len(values) != len(TAGS):
         return None
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("modality scales must be finite")
     return values
 
 
@@ -132,7 +139,9 @@ def apply_to_state_dict(sd: dict, values, geom):
             continue
         stats["present"] += 1
         shape = getattr(tensor, "shape", None)
-        if shape is None or len(shape) != 2 or shape[0] != rows:
+        is_bias = suffix == ".diff_b"
+        expected_rank = 1 if is_bias else 2
+        if shape is None or len(shape) != expected_rank or shape[0] != rows:
             # final_layer.adaln_proj (one modality) and any future geometry land
             # here and are left exactly as they were
             stats["mismatched"] += 1

@@ -55,7 +55,7 @@ _BASE_RMS = {
     "other": 0.1620,
 }
 
-# Median ``rel`` over the 27 non-distillation H3 LoRAs in models/loras/h3.
+# Median ``rel`` over the reference non-distillation H3 LoRA corpus.
 # This is the anchor that makes strength 1.0 mean "the usual amount of change"
 # rather than "whatever this trainer happened to emit".  Chosen as the median
 # rather than a hand-picked target so the calibration agrees with trainer
@@ -69,8 +69,10 @@ REFERENCE_REL = 0.00292
 MIN_FACTOR = 0.05
 MAX_FACTOR = 1.0
 
-_DOWN = (".lora_down.weight", ".lora_A.weight", ".lora_A.default.weight", ".lora_A")
-_UP = (".lora_up.weight", ".lora_B.weight", ".lora_B.default.weight", ".lora_B")
+_DOWN = (".lora_down.weight", ".lora_A.weight", ".lora_A.default.weight", ".lora_A",
+         "_lora.down.weight", ".lora.down.weight", ".lora_linear_layer.down.weight")
+_UP = (".lora_up.weight", ".lora_B.weight", ".lora_B.default.weight", ".lora_B",
+       "_lora.up.weight", ".lora.up.weight", ".lora_linear_layer.up.weight")
 
 _cache: dict[tuple, dict] = {}
 
@@ -117,6 +119,7 @@ class _Accum:
         self.layers = 0
         self.ranks: set[int] = set()
         self.kinds: set[str] = set()
+        self.incomplete = False
 
     def add(self, module: str, delta2: float, out: int, inp: int, kind: str, rank=None):
         rms = _BASE_RMS.get(_group(module), _BASE_RMS["other"])
@@ -135,10 +138,11 @@ class _Accum:
             "layers": self.layers,
             "ranks": sorted(self.ranks),
             "kinds": sorted(self.kinds),
+            "complete": not self.incomplete,
             # exact-duplicate fingerprint: two files with the same layer count
             # and the same total delta energy are the same adapter
             "fingerprint": None if rel is None else f"{self.layers}:{self.delta2:.10g}",
-            "factor": factor_for(rel),
+            "factor": factor_for(rel) if not self.incomplete else 1.0,
         }
 
 
@@ -164,7 +168,12 @@ def _pairs(keys):
         elif suffix == ".alpha":
             slot = "alpha"
         elif suffix in (".lokr_w1", ".lokr_w2", ".lokr_w1_a", ".lokr_w1_b",
-                        ".lokr_w2_a", ".lokr_w2_b", ".diff"):
+                        ".lokr_w2_a", ".lokr_w2_b", ".lokr_t2", ".diff", ".dora_scale"):
+            slot = suffix[1:]
+        elif suffix in (".lora_mid.weight", ".diff_b", ".set_weight", ".reshape_weight",
+                        ".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b",
+                        ".hada_t1", ".hada_t2", ".oft_blocks", ".boft_blocks",
+                        ".rescale", ".w_norm", ".b_norm"):
             slot = suffix[1:]
         if slot:
             mods.setdefault(body, {})[slot] = key
@@ -174,8 +183,15 @@ def _pairs(keys):
 def _measure(mods, get, name: str) -> dict:
     """``mods`` from :func:`_pairs`, ``get(key) -> tensor``."""
     acc = _Accum()
+    measurable = {
+        "down", "up", "alpha", "lokr_w1", "lokr_w2", "lokr_w1_a", "lokr_w1_b",
+        "lokr_w2_a", "lokr_w2_b", "diff",
+    }
     for module, slots in mods.items():
         if _skip(module):
+            continue
+        if set(slots) - measurable or "lokr_t2" in slots:
+            acc.incomplete = True
             continue
         try:
             alpha_key = slots.get("alpha")
@@ -202,7 +218,10 @@ def _measure(mods, get, name: str) -> dict:
             elif "diff" in slots:
                 d = _f32(get(slots["diff"]))
                 acc.add(module, float(d.norm() ** 2), d.shape[0], d.shape[1], "diff")
+            else:
+                acc.incomplete = True
         except Exception as exc:                      # one odd layer must not
+            acc.incomplete = True
             LOG.debug("gain: skipped %s (%s)", module, exc)   # sink the file
     return acc.result(name)
 

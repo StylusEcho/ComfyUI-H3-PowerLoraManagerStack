@@ -366,6 +366,7 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
     if (removeOnCancel && !committed) removeLoraWidget(node, widget);
   };
   const commit = (value) => {
+    const wasBalanced = isBalanced(node);
     committed = true;
     const next = { ...widget.value, lora: value };
     // the balance factor belonged to the file that was here before, so drop the
@@ -382,7 +383,7 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
     widget.value = next;
     node.setDirtyCanvas(true, true);
     close();
-    if (isBalanced(node)) applyBalance(node);
+    if (wasBalanced) applyBalance(node);
   };
   const onOutside = (e) => {
     if (!root.contains(e.target)) close();
@@ -543,6 +544,12 @@ async function applyBalance(node, { force = false } = {}) {
     data = await fetchBalance([...new Set(rows.map((w) => w.value.lora))]);
   } catch (err) {
     console.error("[H3PowerLoraStack] auto-balance failed", err);
+    const button = (node.widgets || []).find((w) => w.h3Role === "balance");
+    if (button) {
+      button.name = "⚖ Balance failed";
+      button.tooltip = err?.message || "Could not measure the selected LoRAs";
+      node.setDirtyCanvas(true, true);
+    }
     return;
   }
   const results = data?.results ?? {};
@@ -550,12 +557,16 @@ async function applyBalance(node, { force = false } = {}) {
     const result = results[widget.value.lora];
     if (!result) continue;
     const manual =
-      widget.value.manual !== undefined ? widget.value.manual : widget.value.strength;
-    const factor = result.factor ?? 1;
+      widget.value.autoApplied && widget.value.manual !== undefined
+        ? widget.value.manual
+        : widget.value.strength;
+    const rawFactor = Number(result.factor ?? 1);
+    if (!Number.isFinite(rawFactor) || rawFactor < 0) continue;
+    const factor = Math.min(1, rawFactor);
     widget.value = {
       ...widget.value,
       manual,
-      strength: round2(manual * factor),
+      strength: manual * factor,
       factor,
       rel: result.rel ?? null,
       note: result.note ?? "",
@@ -666,7 +677,6 @@ app.registerExtension({
       // serialization drops them from both halves of that round trip.
       for (const button of [add, balance, restore]) button.serialize = false;
 
-      fetchLoraList();   // warm the cache so the first picker opens instantly
       resize(this);
     };
 

@@ -33,7 +33,8 @@ This node routes quantized layers through an exact runtime low-rank branch
 `quantized_layers` controls this:
 
 - `auto` (default) — branch quantized layers, merge unquantized ones
-- `branch` — never modify a weight, even in bf16 (fast strength A/B testing)
+- `branch` — never modify a weight, even in bf16 (fast strength A/B testing);
+  adapters without a runtime branch are reported as rejected
 - `merge` — stock behaviour; only useful for comparison
 
 One layer is special-cased: `mlp.fc2` under `TensorWiseINT8Layout` is reached
@@ -106,7 +107,9 @@ two tokens:
 | lycoris                  | `lycoris_blocks_0_...`                                         |
 | peft / diffusers trainer | `base_model.model.blocks.0...`, `transformer.blocks.0...`      |
 
-Verified against all 37 H3 LoRAs in `models/loras/h3`: **zero unmatched keys.**
+The mapper resolves the advertised conventions against the model's own state
+dict. Unmatched keys are reported per row; the installed LoRA collection is not
+part of this package and should be checked when adding new trainer formats.
 
 ### 4. Acc / PDD output heads
 
@@ -114,9 +117,11 @@ alibaba-pai Acc LoRAs ship a 32-interval output-head bank as
 `final_layer.video_out.set_weight` of shape `[3072, 5376]` (`32 × 96`) plus the
 audio twin. Stock Comfy `copy_`s that onto the native `[96, 5376]` head and
 crashes. This node peels those tensors before the stock `set` path and blends
-the heads the sampler step spans (same rule as Comfy PR 15908). Use `simple` at
-8 steps with shifts 12/3 so the steps land on the trained grid. Later stack rows
-that also carry a bank replace the earlier one.
+the heads the sampler step spans (same rule as Comfy PR 15908). The row
+strength interpolates between the native and blended heads; schedules multiply
+that row strength. Use `simple` at 8 steps with shifts 12/3 so the steps land on
+the trained grid. Later stack rows that also carry a bank replace the earlier
+one.
 
 ## Stacking
 
@@ -152,8 +157,8 @@ deltas are scheduled with their LoRA rather than being left at a fixed value.
 
 ## Auto-balance
 
-**Strength 1.0 is not a unit.** Measured across the 27 non-distillation H3 LoRAs
-in `models/loras/h3`, the perturbation produced at strength 1.0 spans **65×** —
+**Strength 1.0 is not a unit.** In the reference non-distillation H3 corpus,
+the perturbation produced at strength 1.0 spans **65×** —
 0.054% of the base weights at one end, 5.24% at the other. Neither rank nor file
 size predicts it: a rank-128 adapter sits at 0.088% while a rank-16 one sits at
 0.40%. So a strength that worked on one LoRA carries no information about the
@@ -288,9 +293,27 @@ auto-balance would have used.
 - Runtime branches apply to `MODEL` from ComfyUI's native H3 loader. The
   streaming loader in `minimaxh3chinkloader` uses its own `MINIMAX_H3_MODEL`
   handle and its own LoRA path.
-- DoRA, LoHa, LoKr and locon adapters always merge — only plain rank
-  decompositions can be branched.
+- DoRA, LoHa, LoKr and locon adapters merge in `auto`; `branch` rejects them
+  because only plain rank decompositions have the stack's runtime branch path.
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+
+The package requires Python 3.10 or newer and a ComfyUI revision providing the
+MiniMax H3 model, `QuantizedTensor`, weight adapters, and patcher wrappers used
+by this node.
+
+## Development checks
+
+From the ComfyUI root, make the package and ComfyUI import roots visible before
+running the tests:
+
+```powershell
+$env:PYTHONPATH = "custom_nodes/ComfyUI-H3-PowerLoraStack;."
+python -m pytest custom_nodes/ComfyUI-H3-PowerLoraStack/tests --import-mode=importlib -q
+```
+
+The package tests cover CPU paths and skip the mixed-device check when no CUDA
+device is available. `node --check web/h3_power_lora_stack.js` validates the
+frontend syntax.
