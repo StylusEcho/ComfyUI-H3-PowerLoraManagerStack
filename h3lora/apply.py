@@ -16,6 +16,7 @@ from . import branch as branch_mod
 from . import gain
 from . import keymap
 from . import modality as modality_mod
+from . import pdd as pdd_mod
 from . import schedule as schedule_mod
 
 LOG = logging.getLogger("h3.powerlorastack")
@@ -121,19 +122,37 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         diffusion_model = patcher.get_model_object("diffusion_model")
     except Exception as exc:
         raise ValueError("H3 Power LoRA Stack requires a MiniMax H3 model") from exc
+    video_dim = int(getattr(diffusion_model.final_layer.video_out, "out_features", 0) or 0)
+    audio_dim = int(getattr(diffusion_model.final_layer.audio_out, "out_features", 0) or 0)
+    hidden = int(getattr(diffusion_model, "hidden_size", 0) or 0)
+    pdd_bank = None
+    pdd_from = None
     target_dim, table = adaln_mod.read_target(diffusion_model)
     if adaln_mode == "off":
         adaln_ctx = None
     else:
         if not grid_path:
             grid_path = adaln_mod.find_silu_grid()
-        adaln_ctx = adaln_mod.AdalnContext(target_dim, table, grid_path)
+        cfg = getattr(getattr(patcher, "model", None), "model_config", None)
+        sidecars = getattr(cfg, "adaln_sidecars", None) if cfg is not None else None
+        adaln_ctx = adaln_mod.AdalnContext(
+            target_dim, table, grid_path,
+            sidecars=sidecars,
+            time_embedder=getattr(diffusion_model, "time_embedder", None),
+        )
 
     mod_values = modality_mod.normalize_scales(modality)
     mod_geom = None if modality_mod.is_identity(mod_values) else modality_mod.geometry(diffusion_model)
 
     report.add(f"base: {detect_quantization(patcher)}")
     report.add(f"adaLN: {'curve' if table is not None else 'dense'} (input dim {target_dim})")
+    if adaln_ctx is not None and table is not None:
+        adaln_ctx.basis()
+        if adaln_ctx.source:
+            line = f"  basis: {adaln_ctx.source}"
+            if adaln_ctx.residual is not None:
+                line += f" (residual {adaln_ctx.residual:.1e})"
+            report.add(line)
     if not modality_mod.is_identity(mod_values) and mod_geom is None:
         report.add("  ! adaLN modality control requested but this model's adaLN "
                    "does not split into the expected modalities - ignored")
@@ -152,6 +171,10 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         lora_sd = comfy.utils.load_torch_file(entry["path"], safe_load=True)
 
         normalized, unmatched = keymap.normalize(lora_sd, index)
+        bank, pdd_note = pdd_mod.peel(normalized, video_dim, audio_dim, hidden)
+        if bank is not None:
+            pdd_bank = bank
+            pdd_from = name
         measured = gain.measure_state_dict(normalized, name)
 
         # before porting: the port derives its bias delta as ``B @ const``, so
@@ -222,6 +245,8 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         detail = f"{len(merge)} merged, {branched_here} branched"
         if unmatched:
             detail += f", {len(unmatched)} unmatched"
+        if pdd_note:
+            detail += f", {pdd_note}"
         report.add(f"{name} @ {strength:g}: {detail}{adaln_note}{mod_note}")
         if row_schedule is not None:
             arrow = "\u2192"
@@ -263,5 +288,10 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             )
         report.add(f"branch bank: {len(per_module)} layers, "
                    f"{report.bank_bytes / (1024 ** 2):.0f} MB")
+
+    if pdd_bank is not None:
+        pdd_mod.attach(patcher, pdd_bank)
+        report.add(f"PDD: {pdd_bank['n']} heads from {pdd_from} "
+                   f"(simple @ 8 steps, shifts 12/3)")
 
     return patcher, report

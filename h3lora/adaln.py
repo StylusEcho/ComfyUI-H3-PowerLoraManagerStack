@@ -39,18 +39,30 @@ its own weights.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import os
+import struct
 
 import torch
+import torch.nn.functional as F
 
 LOG = logging.getLogger(__name__)
 
 GRID_FILENAME = "h3_silu_temb_grid.safetensors"
 _GRID_TENSOR = "silu_t_emb_grid"
+BASIS_SUBDIR = "h3_adaln"
+TE_IN_W = "time_embedder.proj_in.weight"
+TE_IN_B = "time_embedder.proj_in.bias"
+TE_OUT_W = "time_embedder.proj_out.weight"
+TE_OUT_B = "time_embedder.proj_out.bias"
+MAX_RESIDUAL = 5e-3
+FREQ_DIM = 256
 
 _grid_cache: dict[str, torch.Tensor] = {}
-_basis_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_basis_cache: dict[tuple, tuple] = {}
 
 
 def find_silu_grid(extra_dirs=()) -> str:
@@ -97,6 +109,148 @@ def load_silu_grid(path: str) -> torch.Tensor:
     return grid
 
 
+def _cpu_f32(t):
+    return t.detach().to(device="cpu", dtype=torch.float32).contiguous()
+
+
+def tensor_hash(tensor):
+    t = _cpu_f32(tensor)
+    h = hashlib.sha256()
+    h.update(str(tuple(t.shape)).encode())
+    h.update(t.numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def silu_temb_grid(proj_in_w, proj_in_b, proj_out_w, proj_out_b,
+                   rows=1025, freq_dim=FREQ_DIM):
+    t = torch.arange(rows, dtype=torch.float32) / float(rows - 1)
+    half = freq_dim // 2
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32) / half)
+    args = t[:, None] * freqs[None]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    hidden = F.silu(emb @ proj_in_w.float().T + proj_in_b.float())
+    temb = hidden @ proj_out_w.float().T + proj_out_b.float()
+    return F.silu(temb)
+
+
+def grid_from_time_embedder(time_embedder, rows=1025):
+    try:
+        proj_in, proj_out = time_embedder.proj_in, time_embedder.proj_out
+        tensors = (proj_in.weight, proj_in.bias, proj_out.weight, proj_out.bias)
+        if any(t is None or t.device.type == "meta" for t in tensors):
+            return None
+        freq_dim = int(getattr(time_embedder, "freq_dim", FREQ_DIM))
+        return silu_temb_grid(*tensors, rows=rows, freq_dim=freq_dim).clone()
+    except Exception:
+        return None
+
+
+def _safetensors_header(path):
+    with open(path, "rb") as fh:
+        raw = fh.read(8)
+        if len(raw) < 8:
+            return None
+        size = struct.unpack("<Q", raw)[0]
+        if size <= 0 or size > (64 << 20):
+            return None
+        return json.loads(fh.read(size))
+
+
+def _time_embedder_prefix(header):
+    if not header:
+        return None
+    if any(k.endswith("adaln_t_table") for k in header):
+        return None
+    for key in header:
+        if key.endswith(TE_OUT_W):
+            prefix = key[:-len(TE_OUT_W)]
+            if all(prefix + n in header for n in (TE_IN_W, TE_IN_B, TE_OUT_B)):
+                return prefix
+    return None
+
+
+def _load_named(path, names):
+    from safetensors import safe_open
+    with safe_open(path, framework="pt") as f:
+        return [_cpu_f32(f.get_tensor(n)) for n in names]
+
+
+def _basis_dir():
+    try:
+        import folder_paths
+        return os.path.join(folder_paths.models_dir, BASIS_SUBDIR)
+    except Exception:
+        return ""
+
+
+def _cache_path(key):
+    d = _basis_dir()
+    return os.path.join(d, "basis_%s.safetensors" % key) if d else ""
+
+
+def _read_basis_cache(key):
+    path = _cache_path(key)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        from safetensors import safe_open
+        with safe_open(path, framework="pt") as f:
+            meta = f.metadata() or {}
+            return (_cpu_f32(f.get_tensor("V")), _cpu_f32(f.get_tensor("c")),
+                    float(meta.get("residual", "nan")),
+                    meta.get("source", "cache"))
+    except Exception:
+        return None
+
+
+def _write_basis_cache(key, v, c, residual, source):
+    path = _cache_path(key)
+    if not path:
+        return
+    try:
+        from safetensors.torch import save_file
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        save_file({"V": v.contiguous(), "c": c.contiguous()}, path,
+                  metadata={"residual": repr(residual), "source": source, "table_hash": key})
+    except Exception:
+        pass
+
+
+def _iter_diffusion_safetensors():
+    try:
+        import folder_paths
+    except Exception:
+        return
+    for name in folder_paths.get_filename_list("diffusion_models"):
+        if not name.lower().endswith(".safetensors"):
+            continue
+        path = folder_paths.get_full_path("diffusion_models", name)
+        if path:
+            yield os.path.basename(name), path
+
+
+def _grid_from_checkpoint(path, rows):
+    try:
+        prefix = _time_embedder_prefix(_safetensors_header(path))
+        if prefix is None:
+            return None
+        tensors = _load_named(path, [prefix + n for n in (TE_IN_W, TE_IN_B, TE_OUT_W, TE_OUT_B)])
+        return silu_temb_grid(*tensors, rows=rows)
+    except Exception:
+        return None
+
+
+def _table_from_checkpoint(path):
+    try:
+        header = _safetensors_header(path)
+        key = next((k for k in (header or ()) if k.endswith("adaln_t_table")), None)
+        if key is None:
+            return None
+        return _load_named(path, [key])[0]
+    except Exception:
+        return None
+
+
 def fit_basis(table: torch.Tensor, grid: torch.Tensor):
     """Least-squares fit of ``grid ~= 1 c^T + table V^T``.
 
@@ -121,23 +275,29 @@ def fit_basis(table: torch.Tensor, grid: torch.Tensor):
     v = solution[1:].transpose(0, 1).contiguous()                                    # [2688, k]
 
     residual = float((design @ solution - s).norm() / s.norm().clamp(min=1e-12))
-    # The last two curve directions are near-degenerate (sigma_7 ~ sigma_8), so
-    # they differ between bakes and a grid from a different build only agrees to
-    # ~2e-3.  That is still ~6x below the int8 quantization floor, and vastly
-    # better than dropping adaLN entirely, so only a much larger residual is
-    # worth complaining about.
-    if residual > 2e-2:
-        LOG.warning(
-            "H3 PowerLoraStack: adaLN basis fit residual %.2e is high - the silu grid "
-            "and the checkpoint's adaln_t_table probably come from different bakes",
-            residual,
-        )
-    else:
-        LOG.info("H3 PowerLoraStack: adaLN basis fit residual %.2e", residual)
-
     out = (v.to(torch.float32), c.to(torch.float32), residual)
     _basis_cache[key] = out
     return out
+
+
+def sidecar_basis(sidecars, table=None):
+    if not sidecars:
+        return None
+    v, c = sidecars.get("adaln_basis"), sidecars.get("adaln_mean")
+    if torch.is_tensor(v) and torch.is_tensor(c):
+        v, c = _cpu_f32(v), _cpu_f32(c)
+        if v.ndim == 2 and c.ndim == 1 and v.shape[0] == c.shape[0]:
+            if table is None or v.shape[1] == table.shape[1]:
+                return v, c, 0.0, "checkpoint sidecars"
+    grid = sidecars.get("silu_t_emb_grid")
+    if torch.is_tensor(grid) and table is not None:
+        v, c, residual = fit_basis(table, grid)
+        return v, c, residual, "checkpoint silu_t_emb_grid"
+    return None
+
+
+def _accept(residual):
+    return residual == residual and residual <= MAX_RESIDUAL
 
 
 def fit_table_to_table(source_table: torch.Tensor, target_table: torch.Tensor):
@@ -167,52 +327,134 @@ def fit_table_to_table(source_table: torch.Tensor, target_table: torch.Tensor):
 class AdalnContext:
     """Everything needed to move adaLN LoRA pairs between the two bases."""
 
-    def __init__(self, target_dim: int, table=None, grid_path: str = ""):
-        self.target_dim = int(target_dim)
+    def __init__(self, target_dim: int, table=None, grid_path: str = "",
+                 sidecars=None, time_embedder=None):
+        self.target_dim = int(target_dim) if target_dim is not None else 0
         self.table = table
         self.grid_path = grid_path
+        self.sidecars = sidecars or {}
+        self.time_embedder = time_embedder
         self.residual = None
+        self.source = ""
         self._basis = None
         self._failed = False
+        self._curve_cache = {}
 
     @property
     def is_curve(self) -> bool:
         return self.table is not None
 
-    def basis(self, curve_table=None):
-        """``(V, c, residual)`` relating the dense space to a curve basis.
+    def _record(self, v, c, residual, source):
+        if not _accept(residual):
+            LOG.warning(
+                "H3 PowerLoraStack: adaLN basis from %s residual %.2e exceeds %.0e",
+                source, residual, MAX_RESIDUAL,
+            )
+            return None
+        LOG.info("H3 PowerLoraStack: adaLN basis from %s, residual %.2e", source, residual)
+        self._basis = (v, c, residual)
+        self.residual = residual
+        self.source = source
+        return self._basis
 
-        The fit needs whichever side of the conversion is the *curve* side.  On
-        a pruned target that is the checkpoint's own table; on a dense target
-        converting a curve-trained LoRA it has to be the table the LoRA shipped,
-        because nothing else records which bake it was trained against.
-        """
+    def _fit_grid(self, table, grid, source):
+        v, c, residual = fit_basis(table.detach().to("cpu"), grid)
+        return self._record(v, c, residual, source)
+
+    def _scan_grids(self, table):
+        rows = int(table.shape[0])
+        key = tensor_hash(table)
+        cached = _read_basis_cache(key)
+        if cached is not None and _accept(cached[2]):
+            v, c, residual, source = cached
+            return self._record(v, c, residual, "%s (cached)" % source)
+        best = None
+        for label, path in _iter_diffusion_safetensors():
+            grid = _grid_from_checkpoint(path, rows)
+            if grid is None:
+                continue
+            v, c, residual = fit_basis(table.detach().to("cpu"), grid)
+            if best is None or residual < best[2]:
+                best = (v, c, residual, label)
+        if best is not None:
+            _write_basis_cache(key, best[0], best[1], best[2], best[3])
+            return self._record(*best)
+        return None
+
+    def _scan_tables(self, grid):
+        grid_key = tensor_hash(grid)
+        best = None
+        for label, path in _iter_diffusion_safetensors():
+            table = _table_from_checkpoint(path)
+            if table is None or table.shape[0] != grid.shape[0]:
+                continue
+            key = "d%s%s" % (grid_key[:8], tensor_hash(table)[:8])
+            cached = _read_basis_cache(key)
+            if cached is not None:
+                v, c, residual, _src = cached
+            else:
+                v, c, residual = fit_basis(table, grid)
+                _write_basis_cache(key, v, c, residual, label)
+            if best is None or residual < best[2]:
+                best = (v, c, residual, label)
+        if best is None:
+            return None
+        return self._record(*best)
+
+    def basis(self, curve_table=None):
+        """``(V, c, residual)`` relating the dense space to a curve basis."""
         table = self.table if self.table is not None else curve_table
-        if table is None:
+        cache_key = None if table is None else id(table)
+        if table is not self.table and cache_key in self._curve_cache:
+            return self._curve_cache[cache_key]
+        if self.table is not None and (self._basis is not None or self._failed):
+            return self._basis
+        if self._failed and table is None:
+            return None
+
+        got = None
+        if table is not None and table is self.table:
+            got = sidecar_basis(self.sidecars, table)
+            if got is not None:
+                got = self._record(*got)
+
+        if got is None and table is not None:
+            live = grid_from_time_embedder(self.time_embedder, rows=int(table.shape[0])) if self.time_embedder is not None else None
+            if live is not None:
+                got = self._fit_grid(table, live, "live time_embedder")
+
+        if got is None and table is not None and self.grid_path:
+            try:
+                got = self._fit_grid(table, load_silu_grid(self.grid_path), self.grid_path)
+            except Exception as exc:
+                LOG.warning("H3 PowerLoraStack: could not load silu grid (%s)", exc)
+
+        if got is None and table is not None:
+            got = self._scan_grids(table)
+
+        if got is None and table is None:
+            live = grid_from_time_embedder(self.time_embedder) if self.time_embedder is not None else None
+            if live is not None:
+                got = sidecar_basis(self.sidecars, None)
+                if got is not None:
+                    got = self._record(*got)
+                if got is None:
+                    got = self._scan_tables(live)
+
+        if got is None:
             if not self._failed:
                 LOG.warning(
-                    "H3 PowerLoraStack: cannot rebase adaLN onto a dense checkpoint - "
-                    "the LoRA does not carry the adaln_t_table of the curve bake it "
-                    "was trained against"
+                    "H3 PowerLoraStack: adaLN porting unavailable - no baked basis, "
+                    "silu grid, live time embedder, or matching diffusion_models bake"
                 )
                 self._failed = True
+            if table is not self.table and table is not None:
+                self._curve_cache[cache_key] = None
             return None
-        if self._basis is not None or self._failed:
-            return self._basis
-        try:
-            if not self.grid_path:
-                raise ValueError(
-                    f"no {GRID_FILENAME} found; put it in models/h3_adaln/ to enable "
-                    "adaLN porting"
-                )
-            grid = load_silu_grid(self.grid_path)
-            self._basis = fit_basis(table.detach().to("cpu"), grid)
-            self.residual = self._basis[2]
-        except Exception as exc:
-            LOG.warning("H3 PowerLoraStack: adaLN porting unavailable (%s)", exc)
-            self._failed = True
-            self._basis = None
-        return self._basis
+
+        if table is not self.table and table is not None:
+            self._curve_cache[cache_key] = got
+        return got
 
 
 def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None):

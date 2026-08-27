@@ -99,6 +99,16 @@ def inspect(path: str) -> dict:
         k for k in keys
         if not re.search(r"(lora_A|lora_B|lora_down|lora_up|alpha|diff|dora|hada|lokr|oft)", k)
     )[:8]
+    pdd_n = 0
+    for k, v in header.items():
+        if not k.endswith(("video_out.set_weight", "proj_out.weight")):
+            continue
+        shape = v.get("shape") or []
+        if len(shape) == 3 and shape[1] == 96:
+            pdd_n = int(shape[0])
+        elif len(shape) >= 1 and shape[0] % 96 == 0 and shape[0] > 96:
+            pdd_n = int(shape[0] // 96)
+    info["pdd_heads"] = pdd_n
     _cache[key] = info
     return info
 

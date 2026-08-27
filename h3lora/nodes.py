@@ -104,6 +104,8 @@ class H3PowerLoraStack:
       branch instead of a lossy dequantize/requantize merge;
     * adaLN basis mismatch -- LoRAs trained against a dense checkpoint are
       rebased onto a pruned checkpoint's curve, instead of being skipped;
+    * Acc/PDD head banks -- ``video_out.set_weight`` of shape ``[N*96, hidden]``
+      is peeled off before the stock ``set`` path and blended per sampler step;
     * key conventions -- ai-toolkit, kohya, lycoris, peft and bare-prefix
       layouts all resolve against the model's own key set.
     """
@@ -300,6 +302,8 @@ class H3LoraInspector:
             f"adaLN     : {'/'.join(str(d) for d in info['adaln_dims']) or 'none'}",
             f"modules   : {', '.join(info['modules'])}",
         ]
+        if info.get("pdd_heads"):
+            lines.append(f"PDD       : {info['pdd_heads']} output heads")
         if info.get("base_model"):
             lines.append(f"base      : {info['base_model']}")
         if info.get("passenger"):

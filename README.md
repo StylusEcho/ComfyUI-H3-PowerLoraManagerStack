@@ -80,14 +80,17 @@ trained against the checkpoint you are running.
 
 #### The silu grid
 
-Dense↔curve porting needs `h3_silu_temb_grid.safetensors`. It is searched for in
-`models/h3_adaln/`, `models/loras/`, `models/diffusion_models/` and one level
-under `custom_nodes/`. Table-to-table rebasing does not need it. Set
-`adaln_port` to `off` to disable porting entirely.
+Dense↔curve porting prefers a basis already baked into the loaded checkpoint
+(`adaln_basis` + `adaln_mean`, or `silu_t_emb_grid`). If those keys are absent
+it uses a live `time_embedder` on a dense base, then `h3_silu_temb_grid.safetensors`
+(searched in `models/h3_adaln/`, `models/loras/`, `models/diffusion_models/` and
+one level under `custom_nodes/`), then a scored scan of other H3 checkpoints.
+Table-to-table rebasing does not need a grid. Set `adaln_port` to `off` to
+disable porting entirely.
 
-With a grid from a different build the fit bottoms out at ~1.7e-3 relative,
-because the 7th and 8th curve directions are near-degenerate (σ₇ ≈ σ₈) and so
-differ between bakes. That is still ~6× below the int8 quantization floor.
+A grid from a different build bottoms out at ~1.7e-3 relative because the 7th
+and 8th curve directions are near-degenerate (σ₇ ≈ σ₈). Fits worse than 5e-3
+are rejected and the next source is tried.
 
 ### 3. Key conventions
 
@@ -104,6 +107,16 @@ two tokens:
 | peft / diffusers trainer | `base_model.model.blocks.0...`, `transformer.blocks.0...`      |
 
 Verified against all 37 H3 LoRAs in `models/loras/h3`: **zero unmatched keys.**
+
+### 4. Acc / PDD output heads
+
+alibaba-pai Acc LoRAs ship a 32-interval output-head bank as
+`final_layer.video_out.set_weight` of shape `[3072, 5376]` (`32 × 96`) plus the
+audio twin. Stock Comfy `copy_`s that onto the native `[96, 5376]` head and
+crashes. This node peels those tensors before the stock `set` path and blends
+the heads the sampler step spans (same rule as Comfy PR 15908). Use `simple` at
+8 steps with shifts 12/3 so the steps land on the trained grid. Later stack rows
+that also carry a bank replace the earlier one.
 
 ## Stacking
 
