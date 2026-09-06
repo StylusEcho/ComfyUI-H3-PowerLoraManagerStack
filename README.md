@@ -5,7 +5,9 @@ runtime branch, AdaLN pairs are rebased between dense and curve checkpoints, and
 Acc/PDD head banks are blended per sampler step instead of crashing the native
 head.
 
-<img width="1533" height="487" alt="Screenshot 2026-08-08 211513" src="https://github.com/user-attachments/assets/cf7ba1dc-96d9-42ae-8c77-89905319b816" />
+<p align="center">
+  <img src="assets/stack.png" alt="MiniMax H3 Power LoRA Stack with adaLN modality, schedule, and report" width="720">
+</p>
 
 ## Nodes
 
