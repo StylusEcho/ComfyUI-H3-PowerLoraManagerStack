@@ -20,8 +20,10 @@ from . import keymap
 from . import modality as modality_mod
 from . import pdd as pdd_mod
 from . import schedule as schedule_mod
+from . import sidecars as sidecar_mod
 
 LOG = logging.getLogger("h3.powerlorastack")
+sidecar_mod.ensure_load_hook()
 
 # Layers whose forward is bypassed by a fused kernel, per weight layout.  A
 # runtime branch on these would be silently dropped, so they must merge.
@@ -135,11 +137,9 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
     else:
         if not grid_path:
             grid_path = adaln_mod.find_silu_grid()
-        cfg = getattr(getattr(patcher, "model", None), "model_config", None)
-        sidecars = getattr(cfg, "adaln_sidecars", None) if cfg is not None else None
         adaln_ctx = adaln_mod.AdalnContext(
             target_dim, table, grid_path,
-            sidecars=sidecars,
+            sidecars=sidecar_mod.collect(patcher, diffusion_model),
             time_embedder=getattr(diffusion_model, "time_embedder", None),
         )
 

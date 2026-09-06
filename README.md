@@ -304,6 +304,44 @@ The package requires Python 3.10 or newer and a ComfyUI revision providing the
 MiniMax H3 model, `QuantizedTensor`, weight adapters, and patcher wrappers used
 by this node.
 
+<details>
+<summary>(Funny Find)</summary>
+
+• I found overlap, but the evidence does not establish that PlagueKind took the AdaLN fix from your PowerLoraStack. The strongest code matches actually appear earlier in their Git history.
+
+I compared both local repositories, historical versions, tests, and attribution, and verified that the original AdaLN files match their public GitHub snapshots.
+
+| Date (2026) | Evidence |
+| :--- | :--- |
+| August 8 | Your commit 28ac439 introduces AdaLN conversion, including least-squares fitting, reverse conversion, and bias correction. |
+| August 20 | Their commit 7e5743f imports the standalone fix, explicitly credited “by pl0x.” |
+| August 27 | Your commit f38d084 introduces the helpers that most closely match their code. |
+
+### What matches
+
+Two current helpers have identical Python syntax trees after removing docstrings—meaning their executable implementation matches despite differences in comments:
+
+- `_safetensors_header`: yours (`h3lora/adaln.py:155`) / theirs (`C:/comfycli/custom_nodes/ComfyUI-PlagueKind-Nodes/ComfyUI-H3-AdaLN-LoRA-Fix/adaln.py:205`).
+- `_time_embedder_prefix`: yours (`h3lora/adaln.py:166`) / theirs (`C:/comfycli/custom_nodes/ComfyUI-PlagueKind-Nodes/ComfyUI-H3-AdaLN-LoRA-Fix/adaln.py:217`).
+
+Hashing and time-embedding grid helpers also closely resemble each other. These helpers existed in their August 20 import before entering your repository on August 27. That chronology cannot support them copying those helpers from your published version. It also does not establish who originally wrote them.
+
+### What differs
+
+Your earlier implementation converts LoRA state-dictionary entries before loading, using `AdalnContext`, `port_adaln_pairs`, and `.diff_b`. Their implementation repairs already-attached model patches through a separate node.
+
+Comparing your last committed version before their import against all five imported Python files, I found no substantive matching sequence of three or more consecutive nonblank lines after trimming whitespace; matches were import boilerplate. This does not rule out a rewrite or conceptual influence, but it weakens a direct-copy claim.
+
+The shared grid filename also appears in another public H3 project, so that filename alone is not evidence of copying yours. Example
+
+### Attribution and conclusion
+
+I found no credit to you or PowerLoraStack in their current README or fix files. Their import credits “pl0x”; the repository declares MIT, while yours declares Apache-2.0. Those facts alone do not establish a licensing violation.
+
+Your repository records the core solution earlier. Possible influence remains unproven; direct copying from your original implementation is not demonstrated. The most useful next evidence would be the original package supplied by “pl0x” and the development context behind your August 27 changes. Git dates establish recorded chronology, not private authorship or first publication.
+
+</details>
+
 ## Development checks
 
 From the ComfyUI root, make the package and ComfyUI import roots visible before
