@@ -1,272 +1,234 @@
 # ComfyUI-H3-PowerLoraStack
 
-A stacked multi-LoRA loader for **MiniMax H3**, in the spirit of rgthree's Power
-Lora Loader but built around the three things that actually break H3 LoRAs.
+Stacked multi-LoRA loading for **MiniMax H3**. Quantized bases keep an exact
+runtime branch, AdaLN pairs are rebased between dense and curve checkpoints, and
+Acc/PDD head banks are blended per sampler step instead of crashing the native
+head.
 
 <img width="1533" height="487" alt="Screenshot 2026-08-08 211513" src="https://github.com/user-attachments/assets/cf7ba1dc-96d9-42ae-8c77-89905319b816" />
 
 ## Nodes
 
-| Node                            | Purpose                                                                                               |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Node | Purpose |
+| --- | --- |
 | **MiniMax H3 Power LoRA Stack** | Any number of LoRAs on one node, each with a toggle and strength, plus one-click strength calibration |
-| **MiniMax H3 adaLN Modality**   | Scales stacked LoRAs' adaLN modulation per modality (video / text / audio)                            |
-| **MiniMax H3 LoRA Schedule**    | Varies selected stack rows' strength over denoising steps or normalized sigma                         |
-| **MiniMax H3 LoRA Inspector**   | Reports a LoRA's format, rank and adaLN basis without loading it                                      |
+| **MiniMax H3 adaLN Modality** | Scales stacked LoRAs' adaLN modulation per modality (video / text / audio) |
+| **MiniMax H3 LoRA Schedule** | Varies selected stack rows' strength over denoising steps or normalized sigma |
+| **MiniMax H3 LoRA Inspector** | Reports a LoRA's format, rank and adaLN basis without loading it |
 
-## Why not just use a normal LoRA loader
+## Good to know
 
-### 1. Quantized weights: merging destroys the LoRA
+- **AdaLN port — 8 Aug 2026, commit `28ac439`.** This stack rebases dense↔curve
+  AdaLN LoRA pairs so ComfyUI does not skip them with
+  `ERROR lora ... adaln_proj.linear.weight shape '[96768, 8]' is invalid for input of size 260112384`.
+  The port keeps rank and restores the DC term as a bias delta. A separate
+  AdaLN-fix node on the same `MODEL` is not needed; if one is already attached
+  the report tells you to disable it (`adaln_port=off` only if you mean to keep
+  that other node).
+- **`quantized_layers=auto`** branches quantized weights and merges the rest.
+  Stock dequantize/requantize merge destroys small H3 LoRAs.
+- **Strength 1.0 is not a unit.** Auto-balance only ever trims outliers; it
+  never boosts a quiet (e.g. turbo) LoRA.
+- Empty stack rows still run the incoming AdaLN pass, so the node can sit after
+  another loader as a fix.
+- Wire the `report` output to a show-text node (it is also logged).
 
-ComfyUI's stock path is dequantize → add delta → `requantize_from_float(scale="recalculate")`.
-That round trip is **not idempotent**: re-fitting the codebook and re-rounding to
-int4 injects ~1.5% relative weight noise, while a typical H3 LoRA delta is
-0.01–0.08% of the weight. The merge therefore replaces the adapter with noise.
-Measured on a w4a8 checkpoint, the stock merge recovers under a third of the
-LoRA magnitude at cos 0.12–0.14 against the correct result, and takes 128 s
-versus 6.5 s.
+<details>
+<summary>Quantized weights</summary>
+
+ComfyUI's stock path is dequantize → add delta →
+`requantize_from_float(scale="recalculate")`. That round trip is not
+idempotent: re-fitting the codebook and re-rounding to int4 injects ~1.5%
+relative weight noise, while a typical H3 LoRA delta is 0.01–0.08% of the
+weight. On a w4a8 checkpoint the stock merge recovers under a third of the
+LoRA magnitude (cos 0.12–0.14) and takes 128 s versus 6.5 s.
 
 This node routes quantized layers through an exact runtime low-rank branch
-(`y = W_q(x) + B @ A @ x`) instead, keeping the quantized kernel and costing
-~1.5% extra FLOPs at rank 64.
+(`y = W_q(x) + B @ A @ x`), keeping the quantized kernel (~1.5% extra FLOPs at
+rank 64).
 
-`quantized_layers` controls this:
+`quantized_layers`:
 
 - `auto` (default) — branch quantized layers, merge unquantized ones
-- `branch` — never modify a weight, even in bf16 (fast strength A/B testing);
-  adapters without a runtime branch are reported as rejected
+- `branch` — never modify a weight, even in bf16; adapters without a runtime
+  branch are reported as rejected
 - `merge` — stock behaviour; only useful for comparison
 
-One layer is special-cased: `mlp.fc2` under `TensorWiseINT8Layout` is reached
-through `comfy.ops.linear_input_act`, which fuses the activation into the INT8
-kernel and never calls `fc2.forward`. A branch there would be silently dropped,
-so those layers merge even in `branch` mode.
+`mlp.fc2` under `TensorWiseINT8Layout` is reached through
+`comfy.ops.linear_input_act`, which never calls `fc2.forward`. A branch there
+would be dropped, so those layers merge even in `branch` mode.
 
-### 2. adaLN basis mismatch
+</details>
 
-H3 ships in two forms. A *dense* checkpoint feeds `silu(time_embedder(t))`, a
-2688-dim vector, into every `adaln_proj.linear`. A *curve* (pruned) checkpoint
-drops the time embedder and stores an `adaln_t_table` of shape `[grid, 8]`.
+<details>
+<summary>AdaLN basis (dense ↔ curve)</summary>
 
-A LoRA trained against one form has the wrong `lora_A` width for the other, so
-ComfyUI logs `shape '[96768, 8]' is invalid for input of size 260112384` and
-skips the layer. **Dropping those pairs is not an acceptable fix** — on the
-turbo distillation LoRAs the constant term alone is ~100% of the magnitude of
-`dW @ S(t)`, so it discards essentially the whole adapter.
+H3 ships in two forms. A *dense* checkpoint feeds `silu(time_embedder(t))`
+(2688-wide) into every `adaln_proj.linear`. A *curve* (pruned) checkpoint
+stores `adaln_t_table` of shape `[grid, 8]` and drops the time embedder.
 
-This node changes basis instead, which preserves rank:
+A LoRA trained on one form has the wrong `lora_A` width for the other. ComfyUI
+logs the shape error above and skips the layer. Dropping those pairs is not an
+acceptable fix: on turbo distillation LoRAs the constant term alone is ~100% of
+`dW @ S(t)`.
+
+This node changes basis and preserves rank:
 
 ```
 dense -> curve   A' = A @ V,       bias delta  B @ (A @ c)
 curve -> dense   A' = A @ pinv(V), bias delta -B @ (A' @ c)
 ```
 
-where `S(t) = c + V @ table(t)`, recovered by least squares of `[1 | table]`
-against the silu grid. The bias delta is emitted as `.diff_b`, which comfy
-applies as a `("diff",)` patch on the sibling `.bias`; without it the port is
-nearly worthless. Measured end to end, the ported adapter reproduces the dense
-contribution at **cos 0.999998**.
+`S(t) = c + V @ table(t)` is recovered by least squares of `[1 | table]`
+against the silu grid. The bias is emitted as `.diff_b`. End-to-end, the
+ported adapter matches the dense contribution at **cos 0.999998**.
 
-The fit uses the *target checkpoint's own* table, because bakes differ — of two
-local bakes, one ships an uncentered basis (column norms 22.98, 2.67, 1.66, …)
-while the other ships comfy's mean-centered one (7.08, 2.09, 0.75, …).
+The fit uses the *target checkpoint's own* table. Bakes differ: one local bake
+is uncentered (column norms 22.98, 2.67, 1.66, …), another is mean-centered
+(7.08, 2.09, 0.75, …).
 
-**This also catches a silent failure the stock loader cannot see.** Two curve
-bakes have the same adaLN width, so a LoRA trained against one loads without
-complaint on the other and is simply wrong — measured at **cos −0.375**, worse
-than not applying it at all. When a LoRA ships its own `adaln_t_table`, this
-node rebases table-to-table (exactly, cos 1.000000, no grid needed). When it
-does not, the width matches and the mismatch is undetectable — so prefer LoRAs
-trained against the checkpoint you are running.
+Two curve bakes can share AdaLN width, so a LoRA trained on one loads on the
+other without complaint and is simply wrong (measured **cos −0.375**). When a
+LoRA ships `adaln_t_table`, this node rebases table-to-table (cos 1.000000, no
+grid). When it does not, prefer LoRAs trained against the checkpoint you run.
 
-#### The silu grid
+Incoming patches on `MODEL` are scanned by shape and rebased the same way,
+still as a rank decomposition plus `.diff_b`. `adaln_port`: `auto` (default),
+`strip` (drop mismatched pairs), or `off`.
 
-Dense↔curve porting prefers a basis already baked into the loaded checkpoint
-(`adaln_basis` + `adaln_mean`, or `silu_t_emb_grid`). If those keys are absent
-it uses a live `time_embedder` on a dense base, then `h3_silu_temb_grid.safetensors`
-(searched in `models/h3_adaln/`, `models/loras/`, `models/diffusion_models/` and
-one level under `custom_nodes/`), then a scored scan of other H3 checkpoints.
-Table-to-table rebasing does not need a grid. Set `adaln_port` to `off` to
-disable porting entirely.
+**Grid sources.** Prefer a basis baked into the checkpoint (`adaln_basis` +
+`adaln_mean`, or `silu_t_emb_grid`). Else a live `time_embedder` on a dense
+base, then `h3_silu_temb_grid.safetensors` (`models/h3_adaln/`, `models/loras/`,
+`models/diffusion_models/`, one level under `custom_nodes/`), then a scored
+scan of other H3 checkpoints. Table-to-table needs no grid. A grid from the
+wrong build bottoms out at ~1.7e-3; fits worse than 5e-3 are rejected.
 
-A grid from a different build bottoms out at ~1.7e-3 relative because the 7th
-and 8th curve directions are near-degenerate (σ₇ ≈ σ₈). Fits worse than 5e-3
-are rejected and the next source is tried.
+</details>
 
-### 3. Key conventions
+<details>
+<summary>Key conventions</summary>
 
-Every H3 LoRA naming convention resolves against the model's own key set rather
-than by guessing where underscores split, so `qkv_proj` is never mistaken for
-two tokens:
+Keys resolve against the model's own state dict, not by guessing underscore
+splits (`qkv_proj` is never two tokens):
 
-| Convention               | Example                                                        |
-| ------------------------ | -------------------------------------------------------------- |
-| ai-toolkit / diffusers   | `diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight`         |
-| bare (no prefix)         | `blocks.0.attn.qkv_proj.lora_A.weight`                         |
-| kohya / musubi           | `lora_unet_blocks_0_attn_qkv_proj.lora_down.weight` + `.alpha` |
-| lycoris                  | `lycoris_blocks_0_...`                                         |
-| peft / diffusers trainer | `base_model.model.blocks.0...`, `transformer.blocks.0...`      |
+| Convention | Example |
+| --- | --- |
+| ai-toolkit / diffusers | `diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight` |
+| bare (no prefix) | `blocks.0.attn.qkv_proj.lora_A.weight` |
+| kohya / musubi | `lora_unet_blocks_0_attn_qkv_proj.lora_down.weight` + `.alpha` |
+| lycoris | `lycoris_blocks_0_...` |
+| peft / diffusers trainer | `base_model.model.blocks.0...`, `transformer.blocks.0...` |
 
-The mapper resolves the advertised conventions against the model's own state
-dict. Unmatched keys are reported per row; the installed LoRA collection is not
-part of this package and should be checked when adding new trainer formats.
+Unmatched keys are reported per row.
 
-### 4. Acc / PDD output heads
+</details>
+
+<details>
+<summary>Acc / PDD output heads</summary>
 
 alibaba-pai Acc LoRAs ship a 32-interval output-head bank as
 `final_layer.video_out.set_weight` of shape `[3072, 5376]` (`32 × 96`) plus the
 audio twin. Stock Comfy `copy_`s that onto the native `[96, 5376]` head and
 crashes. This node peels those tensors before the stock `set` path and blends
-the heads the sampler step spans (same rule as Comfy PR 15908). The row
-strength interpolates between the native and blended heads; schedules multiply
-that row strength. Use `simple` at 8 steps with shifts 12/3 so the steps land on
-the trained grid. Later stack rows that also carry a bank replace the earlier
-one.
+the heads the sampler step spans (same rule as Comfy PR 15908). Row strength
+interpolates between native and blended heads; schedules multiply that
+strength. Use `simple` at 8 steps with shifts 12/3 so steps land on the trained
+grid. Later stack rows that also carry a bank replace the earlier one.
 
-## Stacking
+</details>
 
-Multiple LoRAs on the same layer are fused into a single pair by concatenating
-along the rank axis:
+<details>
+<summary>Stacking</summary>
+
+Multiple LoRAs on the same layer fuse into one pair by concatenating along the
+rank axis:
 
 ```
 sum_i s_i * B_i @ A_i @ x  ==  [s_1 B_1 | ... | s_N B_N] @ [A_1; ...; A_N] @ x
 ```
 
-so a ten-LoRA stack costs one extra matmul pair per layer, not ten. The factors
-live in a `_LoraBank` registered via `set_additional_models`, so its VRAM is
-accounted for and comfy's weakref bookkeeping stays quiet.
+A ten-LoRA stack costs one extra matmul pair per layer, not ten. Factors live
+in a bank registered via `set_additional_models` so VRAM is accounted for.
 
-## Denoising schedules
+</details>
 
-**MiniMax H3 LoRA Schedule** changes selected stack rows' strength during
-sampling. Wire its `schedule` output into the stack, select rows with `all`,
-`1,3`, or `2-4`, then choose a linear, cosine, smoothstep, power, step, or
-explicit curve. `start_percent` and `end_percent` limit the transition to part
-of the trajectory. Chain schedule nodes for different row groups; the later
-node wins where selectors overlap.
+<details>
+<summary>Denoising schedules</summary>
 
-The `steps` domain follows model-call indices. The `sigma` domain follows the
-scheduler's actual normalized noise values, which can produce a different
-shape with non-linear schedulers. The stack reads `sample_sigmas` supplied by
-ComfyUI automatically, so plain KSampler works and **no SIGMAS wire is needed**.
+Wire **MiniMax H3 LoRA Schedule** into the stack. Select rows with `all`,
+`1,3`, or `2-4`, then a linear, cosine, smoothstep, power, step, or explicit
+curve. `start_percent` / `end_percent` limit the transition. Chain schedule
+nodes; the later node wins where selectors overlap.
 
-Scheduled rows always use the live branch path, including on unquantized bases.
-Any adapter feature or fused layer that cannot run as a branch is merged at the
-row's ordinary static strength and called out in the report. Ported adaLN bias
-deltas are scheduled with their LoRA rather than being left at a fixed value.
+`steps` follows model-call indices. `sigma` follows the scheduler's normalized
+noise. The stack reads `sample_sigmas` from ComfyUI; plain KSampler works, no
+SIGMAS wire.
 
-## Auto-balance
+Scheduled rows always use the live branch path, including on unquantized
+bases. Anything that cannot branch is merged at the row's static strength and
+called out in the report. Ported AdaLN bias deltas follow their LoRA rather
+than staying fixed.
 
-**Strength 1.0 is not a unit.** In the reference non-distillation H3 corpus,
-the perturbation produced at strength 1.0 spans **65×** —
-0.054% of the base weights at one end, 5.24% at the other. Neither rank nor file
-size predicts it: a rank-128 adapter sits at 0.088% while a rank-16 one sits at
-0.40%. So a strength that worked on one LoRA carries no information about the
-next, and the sweet spot has to be rediscovered per file.
+</details>
 
-`⚖ Auto-balance strengths` measures what each active LoRA actually does and puts
-them all on one scale:
+<details>
+<summary>Auto-balance</summary>
+
+In the reference non-distillation H3 corpus, perturbation at strength 1.0 spans
+**65×** (0.054% of base weights vs 5.24%). Rank and file size do not predict
+it. `⚖ Auto-balance strengths` measures each active LoRA and puts them on one
+scale:
 
 ```
 rel = sqrt( sum_l ||dW_l||_F^2 / sum_l ||W_l||_F^2 )
 ```
 
-The factor multiplies the strength you already chose, so your relative intent
-between rows survives — what changes is that a LoRA perturbing the model 18×
-harder than usual stops arriving at full force. `↺ Restore manual strengths`
-puts every row back exactly as it was; the pre-balance value is stashed on the
-row, so it survives saving and reloading the workflow. Editing a strength by
-hand overrides that row and is not clobbered by a later recompute.
+The factor multiplies the strength you already chose, so relative intent
+between rows survives. It is clamped to ≤ 1 (trim only). Distillation adapters
+are quiet on purpose and stay at ×1.00.
 
-**The factor only ever trims** (clamped to ≤ 1). A LoRA measuring *below* the
-reference may be quiet deliberately — distillation adapters sit an order of
-magnitude down and are correct at 1.0 — whereas one measuring far above it
-essentially never is. That asymmetry means no classifier is needed: every turbo
-LoRA in the collection lands on ×1.00 by itself.
+`dW` is never formed. `||B A||_F^2 = tr((B^T B)(A A^T))` uses r×r matrices.
+Results cache on (path, mtime, size). LoKr: `||W1 ⊗ W2||_F = ||W1||_F · ||W2||_F`.
 
-Computing this is only affordable because `dW` is never formed. It is up to
-28672 × 5376 and there are ~260 per file, but
+The reference is the collection *median*. AdaLN is excluded from the
+measurement (basis is checkpoint-dependent; distillation keeps the schedule
+change there). `↺ Restore manual strengths` puts every row back; editing a
+strength by hand is not clobbered by a later recompute.
 
-```
-||B A||_F^2 = tr((B^T B)(A A^T))
-```
+Frobenius energy is not perceptual strength, and it says nothing about
+contention. Distinct LoRAs are near-orthogonal in weight space
+(|cos| ≤ 0.03) yet overlap 3–15× above chance in feature subspaces. Stack
+energy adds in quadrature (`1/√N`, not `1/N`); auto-balance does **not** apply
+that — adding a row never silently weakens the others.
 
-needs only r×r matrices, so a 2.4 GB rank-128 adapter measures in a few seconds,
-almost all of it disk. Results cache on (path, mtime, size). LoKr is handled too
-— `||W1 ⊗ W2||_F = ||W1||_F · ||W2||_F`.
+</details>
 
-The reference is the *median* of the collection rather than a hand-picked
-target, so the calibration agrees with trainer defaults on ordinary files and
-only moves outliers. Base norms come from a per-group constant (measured base
-weight RMS is uniform to ~2× within a group and the four linear groups agree to
-20%), which avoids reading the 20 GB checkpoint.
+<details>
+<summary>AdaLN modality control</summary>
 
-adaLN is excluded from the measurement: its basis is checkpoint-dependent — the
-same adapter shipped dense and curve8 differs 5.7× there — and it is where a
-distillation LoRA keeps the schedule change that must not be normalised away.
+H3 packs audio and video through the same 50 blocks. The only modality-specific
+weights are four tensors (`video_patch_proj`, `audio_patch_proj`,
+`final_layer.video_out`, `final_layer.audio_out`), and typical H3 LoRAs touch
+none of them.
 
-Two honest limits: Frobenius energy is not perceptual strength, and it says
-nothing about *contention*. Distinct LoRAs are near-orthogonal in weight space
-(measured |cos| ≤ 0.03) yet overlap 3–15× above chance in the feature subspaces
-they read and write, so two adapters can still fight over the same features at
-perfectly balanced magnitudes.
+AdaLN does split: `AdalnProj` emits three contiguous blocks of 32256 rows
+(`{video: 0, text: 1, audio: 2}`). Scaling a slice of `lora_B` scales that
+modality's modulation with no runtime hook.
 
-Because the deltas really are near-orthogonal, stack energy adds in quadrature:
-holding a stack at the "one LoRA at 1.0" budget wants `1/√N`, not the `1/N` that
-gets recommended. Auto-balance does **not** apply that — it calibrates each LoRA
-and leaves the total to you, so adding a row never silently weakens the others.
+Wire **MiniMax H3 adaLN Modality** into `adaln_modality`. All three at 1.0 is a
+no-op; 0.0 removes that modality's share. Scaling runs *before* AdaLN porting
+so `.diff_b` inherits it. Geometry is read off the loaded `AdalnProj`;
+`final_layer.adaln_proj` is one-modality and is left alone.
 
-## adaLN modality control
+Where AdaLN is present it is not a marginal knob: 89–99.7% of weight-space
+perturbation for content LoRAs (median ~96%), 16–23% for curve8 turbo
+adapters. Read that as where most of the weight change lives, not as 96% of
+what you see.
 
-**MiniMax H3 is not built like LTX 2.3.** LTX duplicates the tower per modality
-(`audio_attn`, `audio_ff`, `audio_patchify_proj`, `audio_to_video_attn`), so a
-LoRA can be steered by picking layers. H3 packs audio and video into one token
-sequence and pushes both through the same 50 blocks. The only modality-specific
-weights in the entire checkpoint are four tensors — `video_patch_proj`,
-`audio_patch_proj`, `final_layer.video_out`, `final_layer.audio_out` — and none
-of the 46 H3 LoRAs checked touches any of them. There is no layer-name axis.
+</details>
 
-One pathway does separate cleanly: **adaLN**. `AdalnProj.forward` computes
-`linear(t) -> [M, expand*hidden*modalities]` then `view(M*modalities,
-expand*hidden)`, so output feature `j` belongs to modality `j //
-(expand*hidden)`. The 96768 rows are three contiguous blocks of 32256, and
-`comfy/ldm/minimax/model.py` tags segments `{video: 0, text: 1, audio: 2}`.
-Scaling a slice of `lora_B`'s rows scales that modality's modulation exactly,
-with no runtime hook.
-
-Wire **MiniMax H3 adaLN Modality** into the stack's `adaln_modality` input. All
-three at 1.0 is a no-op; 0.0 removes that modality's share of every stacked
-adapter.
-
-This holds for future LoRAs *by construction*: the row order is a property of the
-trained weights, not of ComfyUI. Any adapter that loads onto `adaln_proj.linear`
-at all must match it, whatever its rank, alpha, trainer convention, or adaLN
-basis (dense/curve affects only the `A` side). All seven local H3 bakes — fl2va,
-ref2va, int8-convrot, w4a8-mixed, int4-BQ — carry identical geometry.
-
-The geometry is read off the model's own `AdalnProj` rather than hardcoded, and
-every layer is shape-checked before it is touched, so a future H3 variant either
-adapts or keeps today's behaviour — it cannot slice at the wrong offsets.
-`final_layer.adaln_proj` is `AdalnProj(t_dim, hidden, 2, 1)` — one modality,
-differentiated only by timestep — so it fails that check and is left alone.
-
-Ordering matters and is handled: the scaling runs *before* adaLN porting, which
-derives its bias delta as `B @ const`, so the emitted `.diff_b` inherits it.
-
-
-
-Where adaLN *is* present it is not a marginal knob. Measured on the 14 LoRAs
-whose adaLN basis matches the checkpoint, it carries 89–99.7% of the
-weight-space perturbation for content LoRAs (median ~96%) and 16–23% for the
-curve8 turbo adapters. Caveat: relative Frobenius across differently-shaped
-matrices is an imperfect proxy for perceptual impact, and adaLN's input is only
-8-dimensional, so read that as "where most of the weight change lives", not "96%
-of what you see".
-
-## Output
-
-The `report` string output accounts for every LoRA (wire it to a preview/show-text
-node to read it; it is also written to the console log):
+<details>
+<summary>Report output</summary>
 
 ```
 base: ConvRotW4A4 x300, INT8 x50
@@ -280,78 +242,43 @@ motion_lora @ 1: 0 merged, 104 branched, adaLN modality 1/1/0.25 INACTIVE (LoRA 
 branch bank: 300 layers, 412 MB
 ```
 
-`rel dW` is the measurement above, reported for every LoRA whether or not
-auto-balance was used, so an out-of-scale strength is visible from the API too.
-When the applied strength is far from the calibrated one the line says what
+`rel dW` is reported for every LoRA whether or not auto-balance ran. When the
+applied strength is far from the calibrated one, the line says what
 auto-balance would have used.
-
-## Limitations
-
-- A curve-trained LoRA on a **dense** checkpoint can only be ported if the LoRA
-  carries its own `adaln_t_table`; otherwise there is no record of which bake it
-  was trained against and the adaLN pairs are dropped with a warning.
-- Runtime branches apply to `MODEL` from ComfyUI's native H3 loader. The
-  streaming loader in `minimaxh3chinkloader` uses its own `MINIMAX_H3_MODEL`
-  handle and its own LoRA path.
-- DoRA, LoHa, LoKr and locon adapters merge in `auto`; `branch` rejects them
-  because only plain rank decompositions have the stack's runtime branch path.
-
-## License
-
-Licensed under the [Apache License, Version 2.0](LICENSE).
-
-The package requires Python 3.10 or newer and a ComfyUI revision providing the
-MiniMax H3 model, `QuantizedTensor`, weight adapters, and patcher wrappers used
-by this node.
-
-<details>
-<summary>(Funny Find)</summary>
-
-• I found overlap, but the evidence does not establish that PlagueKind took the AdaLN fix from your PowerLoraStack. The strongest code matches actually appear earlier in their Git history.
-
-I compared both local repositories, historical versions, tests, and attribution, and verified that the original AdaLN files match their public GitHub snapshots.
-
-| Date (2026) | Evidence |
-| :--- | :--- |
-| August 8 | Your commit 28ac439 introduces AdaLN conversion, including least-squares fitting, reverse conversion, and bias correction. |
-| August 20 | Their commit 7e5743f imports the standalone fix, explicitly credited “by pl0x.” |
-| August 27 | Your commit f38d084 introduces the helpers that most closely match their code. |
-
-### What matches
-
-Two current helpers have identical Python syntax trees after removing docstrings—meaning their executable implementation matches despite differences in comments:
-
-- `_safetensors_header`: yours (`h3lora/adaln.py:155`) / theirs (`C:/comfycli/custom_nodes/ComfyUI-PlagueKind-Nodes/ComfyUI-H3-AdaLN-LoRA-Fix/adaln.py:205`).
-- `_time_embedder_prefix`: yours (`h3lora/adaln.py:166`) / theirs (`C:/comfycli/custom_nodes/ComfyUI-PlagueKind-Nodes/ComfyUI-H3-AdaLN-LoRA-Fix/adaln.py:217`).
-
-Hashing and time-embedding grid helpers also closely resemble each other. These helpers existed in their August 20 import before entering your repository on August 27. That chronology cannot support them copying those helpers from your published version. It also does not establish who originally wrote them.
-
-### What differs
-
-Your earlier implementation converts LoRA state-dictionary entries before loading, using `AdalnContext`, `port_adaln_pairs`, and `.diff_b`. Their implementation repairs already-attached model patches through a separate node.
-
-Comparing your last committed version before their import against all five imported Python files, I found no substantive matching sequence of three or more consecutive nonblank lines after trimming whitespace; matches were import boilerplate. This does not rule out a rewrite or conceptual influence, but it weakens a direct-copy claim.
-
-The shared grid filename also appears in another public H3 project, so that filename alone is not evidence of copying yours. Example
-
-### Attribution and conclusion
-
-I found no credit to you or PowerLoraStack in their current README or fix files. Their import credits “pl0x”; the repository declares MIT, while yours declares Apache-2.0. Those facts alone do not establish a licensing violation.
-
-Your repository records the core solution earlier. Possible influence remains unproven; direct copying from your original implementation is not demonstrated. The most useful next evidence would be the original package supplied by “pl0x” and the development context behind your August 27 changes. Git dates establish recorded chronology, not private authorship or first publication.
 
 </details>
 
-## Development checks
+<details>
+<summary>Limitations</summary>
 
-From the ComfyUI root, make the package and ComfyUI import roots visible before
-running the tests:
+- A curve-trained LoRA on a **dense** checkpoint can only be ported if the LoRA
+  carries its own `adaln_t_table`; otherwise those AdaLN pairs are dropped with
+  a warning.
+- Runtime branches apply to `MODEL` from ComfyUI's native H3 loader. The
+  streaming loader in `minimaxh3chinkloader` uses its own handle and LoRA path.
+- DoRA, LoHa, LoKr and locon merge in `auto`; `branch` rejects them (only plain
+  rank decompositions have the runtime branch path).
+
+</details>
+
+<details>
+<summary>Development checks</summary>
+
+From the ComfyUI root:
 
 ```powershell
 $env:PYTHONPATH = "custom_nodes/ComfyUI-H3-PowerLoraStack;."
 python -m pytest custom_nodes/ComfyUI-H3-PowerLoraStack/tests --import-mode=importlib -q
 ```
 
-The package tests cover CPU paths and skip the mixed-device check when no CUDA
-device is available. `node --check web/h3_power_lora_stack.js` validates the
-frontend syntax.
+CPU paths are covered; the mixed-device check skips without CUDA.
+`node --check web/h3_power_lora_stack.js` validates the frontend.
+
+Requires Python 3.10+ and a ComfyUI revision with MiniMax H3,
+`QuantizedTensor`, weight adapters, and patcher wrappers.
+
+</details>
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

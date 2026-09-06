@@ -112,6 +112,9 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
     ``mode`` is ``auto`` (branch quantized layers, merge the rest), ``merge``
     (stock behaviour) or ``branch`` (never touch a weight).
 
+    ``adaln_mode`` is ``auto`` (rebase this stack and any adaLN adapters already
+    on ``model``), ``strip`` (drop mismatched pairs) or ``off``.
+
     ``modality`` optionally scales each LoRA's adaLN modulation per modality;
     see :mod:`h3lora.modality`.
     """
@@ -148,6 +151,11 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
 
     report.add(f"base: {detect_quantization(patcher)}")
     report.add(f"adaLN: {'curve' if table is not None else 'dense'} (input dim {target_dim})")
+    if adaln_mode != "off":
+        upstream = adaln_mod.upstream_adaln_fix_warning(model)
+        if upstream:
+            report.add(upstream)
+            LOG.warning("H3 PowerLoraStack:\n%s", upstream)
     if adaln_ctx is not None and table is not None:
         adaln_ctx.basis()
         if adaln_ctx.source:
@@ -155,6 +163,24 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             if adaln_ctx.residual is not None:
                 line += f" (residual {adaln_ctx.residual:.1e})"
             report.add(line)
+    if adaln_ctx is not None:
+        try:
+            patcher, attached = adaln_mod.port_attached_patches(
+                patcher, adaln_ctx, mode=adaln_mode)
+        except Exception as exc:
+            LOG.exception("H3 PowerLoraStack: incoming adaLN port failed")
+            report.add(f"  ! incoming adaLN port failed ({exc}); left upstream patches")
+        else:
+            if attached["ported"] or attached["stripped"] or attached["unportable"]:
+                line = (f"  incoming adaLN: ported {attached['ported']}, "
+                        f"stripped {attached['stripped']}, "
+                        f"unportable {attached['unportable']} "
+                        f"across {attached['keys']} key(s)")
+                if attached["residual"] is not None:
+                    line += f" (basis fit {attached['residual']:.1e})"
+                report.add(line)
+                for note in attached["notes"][:8]:
+                    report.add(f"    ! {note}")
     if not modality_mod.is_identity(mod_values) and mod_geom is None:
         report.add("  ! adaLN modality control requested but this model's adaLN "
                    "does not split into the expected modalities - ignored")
@@ -205,8 +231,14 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         table_key = next((key for key in normalized if key.endswith("adaln_t_table")), None)
         source_table = normalized.pop(table_key) if table_key is not None else None
         if adaln_ctx is not None and target_dim:
-            normalized, stats = adaln_mod.port_adaln_pairs(
-                normalized, adaln_ctx, source_table=source_table)
+            try:
+                normalized, stats = adaln_mod.port_adaln_pairs(
+                    normalized, adaln_ctx, source_table=source_table,
+                    mode=adaln_mode)
+            except Exception as exc:
+                LOG.exception("H3 PowerLoraStack: adaLN port failed for %s", name)
+                report.add(f"{name}: adaLN port failed ({exc}); pairs left as-is")
+                stats = {"ported": 0, "skipped": 0, "ok": 0, "rebased": 0, "residual": None}
             if stats["ported"]:
                 adaln_note = f", adaLN ported x{stats['ported']}"
             if stats["rebased"]:
@@ -398,4 +430,5 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
                    f"(strength {pdd_entry['strength']:g}, "
                    f"{pdd_mod.bank_bytes(pdd_bank) / (1024 ** 2):.0f} MB, shifts 12/3)")
 
+    adaln_mod.mark_stack_adaln(patcher)
     return patcher, report

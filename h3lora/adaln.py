@@ -45,11 +45,16 @@ import logging
 import math
 import os
 import struct
+import uuid
 
 import torch
 import torch.nn.functional as F
 
 LOG = logging.getLogger(__name__)
+# Stamped on MODEL so a later stack node can tell our port from a post-hoc
+# AdaLN-fix node that multiplies dense LoRAs out to full weight diffs.
+_STACK_MARK = "h3_power_lora_adaln"
+_UPSTREAM_FIX_MIN_KEYS = 8
 
 GRID_FILENAME = "h3_silu_temb_grid.safetensors"
 _GRID_TENSOR = "silu_t_emb_grid"
@@ -147,7 +152,8 @@ def grid_from_time_embedder(time_embedder, rows=1025):
         if any(t is None or t.device.type == "meta" for t in tensors):
             return None
         freq_dim = int(getattr(time_embedder, "freq_dim", FREQ_DIM))
-        return silu_temb_grid(*tensors, rows=rows, freq_dim=freq_dim).clone()
+        with torch.no_grad():
+            return silu_temb_grid(*tensors, rows=rows, freq_dim=freq_dim).clone()
     except Exception:
         return None
 
@@ -465,7 +471,7 @@ class AdalnContext:
         return got
 
 
-def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None):
+def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None, mode="auto"):
     """Rebase every ``adaln_proj.linear`` LoRA pair onto the target's basis.
 
     ``source_table`` is the LoRA's own ``adaln_t_table`` if it shipped one.
@@ -540,6 +546,11 @@ def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None):
         elif source_dim == ctx.target_dim and not table_map_failed:
             stats["ok"] += 1
             continue
+        elif mode == "strip":
+            for key in parts.values():
+                out.pop(key, None)
+            stats["skipped"] += 1
+            continue
         else:
             if basis is None:
                 basis = ctx.basis(curve_table=source_table)
@@ -596,6 +607,271 @@ def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None):
         stats[kind] += 1
 
     return out, stats
+
+
+def _diff_payload(value):
+    """Tensor inside a ``("diff", (t,))`` patch value, or None."""
+    if not isinstance(value, tuple) or not value or value[0] != "diff":
+        return None
+    body = value[1] if len(value) > 1 else None
+    if isinstance(body, (tuple, list)) and body and torch.is_tensor(body[0]):
+        return body[0]
+    if torch.is_tensor(body):
+        return body
+    return None
+
+
+def _patch_value(patch):
+    if isinstance(patch, (tuple, list)) and len(patch) > 1:
+        return patch[1]
+    return patch
+
+
+def stack_adaln_marked(patcher) -> bool:
+    opts = getattr(patcher, "model_options", None)
+    if isinstance(opts, dict) and opts.get(_STACK_MARK):
+        return True
+    return bool(getattr(patcher, _STACK_MARK, False))
+
+
+def mark_stack_adaln(patcher):
+    """Record that this stack already handled adaLN, so a later node can skip the warning."""
+    opts = getattr(patcher, "model_options", None)
+    if isinstance(opts, dict):
+        patcher.model_options = dict(opts)
+        patcher.model_options[_STACK_MARK] = True
+    try:
+        setattr(patcher, _STACK_MARK, True)
+    except Exception:
+        pass
+
+
+def upstream_adaln_fix_warning(patcher) -> str:
+    """Warn when a separate post-hoc AdaLN fix has already rewritten MODEL patches.
+
+    That node stores multiplied-out ``("diff",)`` weight+bias pairs on every
+    ``adaln_proj.linear``. This stack rebases on load and keeps rank, so both
+    together can double the DC term. We cannot see the graph, only the patches.
+
+    Returns a multi-line note, or ``""`` if nothing looks like that fix.
+    """
+    if patcher is None or stack_adaln_marked(patcher):
+        return ""
+    patches = getattr(patcher, "patches", None) or {}
+    weight_diffs = 0
+    bias_diffs = 0
+    for key, plist in patches.items():
+        if not key.endswith("adaln_proj.linear.weight") and not key.endswith("adaln_proj.linear.bias"):
+            continue
+        for patch in plist or ():
+            tensor = _diff_payload(_patch_value(patch))
+            if tensor is None:
+                continue
+            if key.endswith(".weight") and tensor.ndim == 2:
+                weight_diffs += 1
+                break
+            if key.endswith(".bias") and tensor.ndim == 1:
+                bias_diffs += 1
+                break
+    if weight_diffs < _UPSTREAM_FIX_MIN_KEYS or bias_diffs < _UPSTREAM_FIX_MIN_KEYS:
+        return ""
+    return (
+        f"! MODEL already has a post-hoc AdaLN fix on it ({weight_diffs} adaLN "
+        f"keys stored as full weight diffs plus {bias_diffs} bias diffs).\n"
+        "  This stack already rebases adaLN when it loads LoRAs, and rewrites "
+        "mismatched adapters that were already on MODEL, while keeping rank.\n"
+        "  Disable the extra AdaLN LoRA Fix node. Leaving both can double-apply "
+        "the DC/bias term and fight over patches.\n"
+        "  If you intend to keep that node, set adaln_port=off on this stack."
+    )
+
+
+class _WeightAdapter:
+    """Minimal stand-in when the original adapter class cannot be reconstructed."""
+
+    def __init__(self, weights):
+        self.weights = weights
+
+
+def _plain_lora_weights(value):
+    """``(up, down, alpha)`` of a 2-D LoRA adapter, or None for locon/DoRA/diff."""
+    weights = getattr(value, "weights", None)
+    if weights is None or len(weights) < 3:
+        return None
+    up, down = weights[0], weights[1]
+    if not (torch.is_tensor(up) and torch.is_tensor(down)):
+        return None
+    if up.ndim != 2 or down.ndim != 2 or up.shape[1] != down.shape[0]:
+        return None
+    if len(weights) > 3 and any(weights[i] is not None for i in (3, 4, 5) if i < len(weights)):
+        return None
+    return weights
+
+
+def _rebuild_adapter(original, merged):
+    cls = type(original)
+    try:
+        return cls(set(), merged)
+    except Exception:
+        try:
+            obj = object.__new__(cls)
+            obj.weights = merged
+            return obj
+        except Exception:
+            return _WeightAdapter(merged)
+
+
+def _patch_unportable(patch, weights, target, v, reverse):
+    """Why this attached adapter cannot be rebased, or None if it can."""
+    if len(patch) > 2 and patch[2] != 1.0:
+        return "strength_model=%r" % (patch[2],)
+    if len(patch) > 3 and patch[3] is not None:
+        return "patch offset"
+    if len(patch) > 4 and patch[4] is not None:
+        return "patch function"
+    want_in, want_width = (v.shape[1], v.shape[0]) if reverse else (v.shape[0], v.shape[1])
+    if weights[1].shape[1] != want_in:
+        return "LoRA input dim %d, basis expects %d" % (weights[1].shape[1], want_in)
+    if target.shape[1] != want_width:
+        return "target width %d, basis produces %d" % (target.shape[1], want_width)
+    if weights[0].shape[0] != target.shape[0]:
+        return "LoRA output dim %d, target %d" % (weights[0].shape[0], target.shape[0])
+    return None
+
+
+def port_attached_patches(patcher, ctx: AdalnContext, mode="auto"):
+    """Rank-preserving rebase of mismatched adaLN adapters already on ``patcher``.
+
+    Covers LoRAs applied by any upstream loader. Shape
+    mismatch is detected on the live patches, so ComfyUI does not have to raise
+    first. ``mode`` ``strip`` drops the mismatched adapters without rebasing.
+
+    Returns ``(patcher, stats)``.
+    """
+    stats = {"ported": 0, "stripped": 0, "unportable": 0, "keys": 0,
+             "residual": None, "notes": []}
+    if mode == "off" or ctx is None or ctx.target_dim is None:
+        return patcher, stats
+    patches = getattr(patcher, "patches", None)
+    if not patches:
+        return patcher, stats
+    try:
+        state_dict = patcher.model_state_dict()
+    except Exception:
+        return patcher, stats
+
+    found = {}
+    for key in list(patches.keys()):
+        if not key.endswith("adaln_proj.linear.weight"):
+            continue
+        target = state_dict.get(key)
+        if target is None or getattr(target, "ndim", None) != 2:
+            continue
+        keep, bad = [], []
+        for patch in patches[key]:
+            if not isinstance(patch, (tuple, list)) or len(patch) < 2:
+                keep.append(patch)
+                continue
+            raw = getattr(patch[1], "weights", None)
+            if (raw is None or len(raw) < 2
+                    or not torch.is_tensor(raw[0]) or not torch.is_tensor(raw[1])):
+                keep.append(patch)
+                continue
+            if raw[0].shape[0] == target.shape[0] and raw[1].shape[1] == target.shape[1]:
+                keep.append(patch)
+                continue
+            weights = _plain_lora_weights(patch[1])
+            if weights is None:
+                keep.append(patch)
+                stats["unportable"] += 1
+                stats["notes"].append("%s: locon/DoRA/reshape adapter" % key)
+            else:
+                bad.append((patch, weights))
+        if bad:
+            found[key] = (keep, bad, target)
+    if not found:
+        return patcher, stats
+    stats["keys"] = len(found)
+
+    basis = None
+    basis_pinv = None
+    if mode != "strip":
+        basis = ctx.basis()
+        if basis is None:
+            stats["notes"].append("no adaLN basis; stripped incoming mismatched patches")
+            mode = "strip"
+        else:
+            stats["residual"] = basis[2]
+
+    patched = patcher.clone()
+    bias_diffs = {}
+    for key, (keep, bad, target) in found.items():
+        if keep:
+            patched.patches[key] = list(keep)
+        else:
+            patched.patches.pop(key, None)
+
+        if mode == "strip" or basis is None:
+            stats["stripped"] += len(bad)
+            continue
+
+        v, c, _residual = basis
+        reverse = bad[0][1][1].shape[1] == v.shape[1] and target.shape[1] == v.shape[0]
+        if reverse and basis_pinv is None:
+            basis_pinv = torch.linalg.pinv(v.to(torch.float32))
+
+        rebuilt = []
+        for patch, weights in bad:
+            reason = _patch_unportable(patch, weights, target, v, reverse)
+            if reason is not None:
+                stats["unportable"] += 1
+                stats["notes"].append("%s: %s" % (key, reason))
+                continue
+            up, down, alpha = weights[0], weights[1], weights[2]
+            a32 = down.to(torch.float32)
+            v32 = v.to(device=a32.device, dtype=torch.float32)
+            c32 = c.to(device=a32.device, dtype=torch.float32)
+            if reverse:
+                a_new = a32 @ basis_pinv.to(device=a32.device)
+                const = a_new @ c32
+                sign = -1.0
+            else:
+                a_new = a32 @ v32
+                const = a32 @ c32
+                sign = 1.0
+            rank = a_new.shape[0]
+            alpha_scale = float(alpha) / rank if alpha is not None else 1.0
+            strength = float(patch[0])
+            bias_delta = sign * strength * alpha_scale * (up.to(torch.float32) @ const)
+            merged = (up, a_new.to(down.dtype), alpha, None, None, None)
+            adapter = _rebuild_adapter(patch[1], merged)
+            rest = tuple(patch[2:]) if len(patch) > 2 else (1.0, None, None)
+            rebuilt.append((patch[0], adapter) + rest)
+
+            bias_key = key[:-len("weight")] + "bias"
+            bias = state_dict.get(bias_key)
+            if bias is None:
+                stats["notes"].append("%s missing, DC term dropped" % bias_key)
+            else:
+                prev = bias_diffs.get(bias_key)
+                bias_diffs[bias_key] = bias_delta if prev is None else prev + bias_delta
+            stats["ported"] += 1
+
+        if rebuilt:
+            patched.patches.setdefault(key, []).extend(rebuilt)
+
+    for bias_key, delta in bias_diffs.items():
+        bias = state_dict[bias_key]
+        payload = ("diff", (delta.to(bias.dtype),))
+        try:
+            patched.add_patches({bias_key: payload}, 1.0)
+        except Exception:
+            patched.patches.setdefault(bias_key, []).append(
+                (1.0, payload, 1.0, None, None))
+
+    if stats["ported"] or stats["stripped"]:
+        patched.patches_uuid = uuid.uuid4()
+    return patched, stats
 
 
 def read_target(diffusion_model):

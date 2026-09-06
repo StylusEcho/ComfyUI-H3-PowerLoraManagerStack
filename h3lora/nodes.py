@@ -122,8 +122,7 @@ def _collect(kwargs, issues=None):
 class H3PowerLoraStack:
     """Stacked multi-LoRA loader for MiniMax H3 across every weight format.
 
-    Handles the three things the stock loader and rgthree's Power Lora Loader
-    get wrong on H3:
+    Handles the three things generic LoRA loaders get wrong on H3:
 
     * quantized bases -- w4a8/int4 weights are patched with an exact runtime
       branch instead of a lossy dequantize/requantize merge;
@@ -147,10 +146,12 @@ class H3PowerLoraStack:
                                "branch: never modify a weight. merge: stock behaviour "
                                "(destroys LoRAs on w4a8/int4).",
                 }),
-                "adaln_port": (["auto", "off"], {
+                "adaln_port": (["auto", "strip", "off"], {
                     "default": "auto",
-                    "tooltip": "Rebase adaLN LoRA pairs between dense (2688) and curve (8) "
-                               "checkpoints. Needs h3_silu_temb_grid.safetensors.",
+                    "tooltip": "auto: rebase adaLN pairs on this stack and any already on MODEL "
+                               "between dense (2688) and curve (8), including curve-to-curve "
+                               "when the LoRA ships a table. strip: drop mismatched pairs. "
+                               "off: leave them.",
                 }),
                 "adaln_modality": ("H3_MODALITY", {
                     "tooltip": "Optional. Wire a MiniMax H3 adaLN Modality node here to "
@@ -178,14 +179,21 @@ class H3PowerLoraStack:
 
         issues = []
         entries = _collect(kwargs, issues)
-        if not entries:
-            return (model, "no LoRAs enabled" + ("\n" + "\n".join(issues) if issues else ""))
-
-        patcher, report = apply_mod.apply_stack(
-            model, entries, mode=quantized_layers, adaln_mode=adaln_port,
-            modality=adaln_modality, schedule=schedule,
-        )
+        try:
+            patcher, report = apply_mod.apply_stack(
+                model, entries, mode=quantized_layers, adaln_mode=adaln_port,
+                modality=adaln_modality, schedule=schedule,
+            )
+        except Exception as exc:
+            LOG.exception("H3 Power LoRA Stack failed; passing the model through")
+            extra = "\n".join(issues)
+            return (model, f"stack failed ({exc}); model unchanged"
+                    + ("\n" + extra if extra else ""))
         text = report.text()
+        if not entries and not text.strip():
+            text = "no LoRAs enabled"
+        if issues:
+            text = text + ("\n" if text else "") + "\n".join(issues)
         LOG.info("H3 Power LoRA Stack:\n%s", text)
         return (patcher, text)
 
