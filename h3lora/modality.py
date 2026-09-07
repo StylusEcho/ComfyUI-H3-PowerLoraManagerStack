@@ -45,7 +45,7 @@ import math
 
 import torch
 
-LOG = logging.getLogger("h3.powerlorastack")
+LOG = logging.getLogger("h3.powerloramanagerstack")
 
 # Index is the modality tag from comfy/ldm/minimax/model.py ``seg_tag``.
 TAGS = ("video", "text", "audio")
@@ -80,7 +80,7 @@ def geometry(diffusion_model):
     except (AttributeError, TypeError, ValueError):
         return None
     if modalities != len(TAGS) or expand <= 0 or hidden <= 0:
-        LOG.warning("H3 PowerLoraStack: adaLN has %d modalities, expected %d - "
+        LOG.warning("H3 PowerLoraManagerStack: adaLN has %d modalities, expected %d - "
                     "modality control disabled", modalities, len(TAGS))
         return None
     return expand, modalities, hidden

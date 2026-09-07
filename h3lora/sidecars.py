@@ -18,7 +18,7 @@ import logging
 
 import torch
 
-LOG = logging.getLogger("h3.powerlorastack")
+LOG = logging.getLogger("h3.powerloramanagerstack")
 
 SIDECAR_NAMES = ("adaln_basis", "adaln_mean", "silu_t_emb_grid")
 STASH_ATTR = "_h3_adaln_sidecars"
@@ -108,7 +108,7 @@ def attach(model, sidecars: dict):
             setter(PATCHER_ATTACHMENT, merged)
         except Exception:
             pass
-    LOG.info("H3 PowerLoraStack: captured checkpoint adaLN sidecars %s",
+    LOG.info("H3 PowerLoraManagerStack: captured checkpoint adaLN sidecars %s",
              ", ".join(sorted(merged)))
 
 
@@ -198,6 +198,6 @@ def ensure_load_hook() -> bool:
         try:
             installed = wrap_load_model_weights(cls) or installed
         except Exception:
-            LOG.debug("H3 PowerLoraStack: could not wrap %s.load_model_weights",
+            LOG.debug("H3 PowerLoraManagerStack: could not wrap %s.load_model_weights",
                       name, exc_info=True)
     return installed

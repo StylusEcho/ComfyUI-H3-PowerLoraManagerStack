@@ -1,22 +1,68 @@
-# ComfyUI-H3-PowerLoraStack
+# ComfyUI-H3-PowerLoraManagerStack
 
-Stacked multi-LoRA loading for **MiniMax H3**. Quantized bases keep an exact
-runtime branch, AdaLN pairs are rebased between dense and curve checkpoints, and
-Acc/PDD head banks are blended per sampler step instead of crashing the native
-head.
+One node: **H3 Power LoRA Stack (LoRA Manager)** — stacked multi-LoRA loading
+for **MiniMax H3**, with a search bar that pulls its rows straight out of a
+[ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager)
+library.
 
-<p align="center">
-  <img src="assets/stack.png" alt="MiniMax H3 Power LoRA Stack with adaLN modality, schedule, and report" width="720">
-</p>
+Quantized bases keep an exact runtime branch, AdaLN pairs are rebased between
+dense and curve checkpoints, and Acc/PDD head banks are blended per sampler step
+instead of crashing the native head.
 
-## Nodes
+This is an alternative build of the
+[MiniMax H3 Power LoRA Stack](https://github.com/cicalooo/ComfyUI-H3-PowerLoraStack).
+It registers under its own node id (`H3PowerLoraManagerStack`), its own web
+extension and its own HTTP route, so it can sit next to that pack in the same
+ComfyUI install without either one shadowing the other.
 
-| Node | Purpose |
+## The node
+
+| Input | |
 | --- | --- |
-| **MiniMax H3 Power LoRA Stack** | Any number of LoRAs on one node, each with a toggle and strength, plus one-click strength calibration |
-| **MiniMax H3 adaLN Modality** | Scales stacked LoRAs' adaLN modulation per modality (video / text / audio) |
-| **MiniMax H3 LoRA Schedule** | Varies selected stack rows' strength over denoising steps or normalized sigma |
-| **MiniMax H3 LoRA Inspector** | Reports a LoRA's format, rank and adaLN basis without loading it |
+| `model` | The H3 `MODEL` to patch |
+| `quantized_layers` | `auto` / `branch` / `merge` |
+| `adaln_port` | `auto` / `strip` / `off` |
+| `adaln_video` `adaln_text` `adaln_audio` | Per-modality adaLN scaling; all three at 1.0 is a no-op |
+| `lora_stack` | Optional `LORA_STACK`, e.g. from **Lora Stacker (LoraManager)** |
+
+| Output | |
+| --- | --- |
+| `MODEL` | Patched model |
+| `report` | Per-LoRA account of what was applied |
+| `trigger_words` | The library's trained words for the applied LoRAs, `,, `-separated — drops straight into **TriggerWord Toggle (LoraManager)** |
+
+Rows themselves are added in the browser: **🔍 Add LoRA** opens the search bar,
+each row gets a toggle, a strength and a remove button, and there is no limit on
+how many.
+
+## The LoRA Manager connection
+
+With ComfyUI-Lora-Manager installed, the search bar queries the library live:
+
+- **Search** across file name, the creator's model name and tags, fuzzy, so
+  `turbo` finds a LoRA whose file is named after its hash.
+- **Filter** by base model, or to your favourites.
+- Results carry the manager's **preview, model name, version and base model**,
+  and picking one adopts the **strength preset** saved on that model.
+- The row keeps the **trigger words** the manager holds, which is what feeds the
+  `trigger_words` output.
+- The footer links through to the manager's own library page.
+
+Nothing imports the manager's Python package — its module layout moves between
+releases. The browser talks to its HTTP API (`/api/lm/…`) on ComfyUI's own
+aiohttp app, and the Python side reads the `<model>.metadata.json` sidecar the
+manager writes next to each file, which is what recovers trigger words for a row
+restored from a saved workflow.
+
+Without the manager the search bar falls back to filtering ComfyUI's own
+`models/loras` listing and the node works as an ordinary stack; the footer
+button switches between the two sources by hand.
+
+A row picked from the library also stores the absolute path the manager reported
+for it. `models/loras` is still tried first, so a workflow keeps resolving
+through ComfyUI's listing when the manager is not running — the stored path is
+the fallback, and is what lets a library configured under `extra_loras_roots`,
+outside `models/loras` entirely, load at all.
 
 ## Good to know
 
@@ -133,9 +179,12 @@ alibaba-pai Acc LoRAs ship a 32-interval output-head bank as
 audio twin. Stock Comfy `copy_`s that onto the native `[96, 5376]` head and
 crashes. This node peels those tensors before the stock `set` path and blends
 the heads the sampler step spans (same rule as Comfy PR 15908). Row strength
-interpolates between native and blended heads; schedules multiply that
-strength. Use `simple` at 8 steps with shifts 12/3 so steps land on the trained
-grid. Later stack rows that also carry a bank replace the earlier one.
+interpolates between native and blended heads. Use `simple` at 8 steps with
+shifts 12/3 so steps land on the trained grid. Later stack rows that also carry
+a bank replace the earlier one.
+
+The stack reads `sample_sigmas` from ComfyUI, so a plain KSampler works with no
+SIGMAS wire.
 
 </details>
 
@@ -152,24 +201,10 @@ sum_i s_i * B_i @ A_i @ x  ==  [s_1 B_1 | ... | s_N B_N] @ [A_1; ...; A_N] @ x
 A ten-LoRA stack costs one extra matmul pair per layer, not ten. Factors live
 in a bank registered via `set_additional_models` so VRAM is accounted for.
 
-</details>
-
-<details>
-<summary>Denoising schedules</summary>
-
-Wire **MiniMax H3 LoRA Schedule** into the stack. Select rows with `all`,
-`1,3`, or `2-4`, then a linear, cosine, smoothstep, power, step, or explicit
-curve. `start_percent` / `end_percent` limit the transition. Chain schedule
-nodes; the later node wins where selectors overlap.
-
-`steps` follows model-call indices. `sigma` follows the scheduler's normalized
-noise. The stack reads `sample_sigmas` from ComfyUI; plain KSampler works, no
-SIGMAS wire.
-
-Scheduled rows always use the live branch path, including on unquantized
-bases. Anything that cannot branch is merged at the row's static strength and
-called out in the report. Ported AdaLN bias deltas follow their LoRA rather
-than staying fixed.
+Entries arriving on `lora_stack` are applied ahead of this node's own rows, so a
+**Lora Stacker (LoraManager)** chain can feed straight in. CLIP strengths on
+those entries are ignored rather than folded into the model strength — H3 has no
+CLIP tower on this path.
 
 </details>
 
@@ -185,9 +220,10 @@ scale:
 rel = sqrt( sum_l ||dW_l||_F^2 / sum_l ||W_l||_F^2 )
 ```
 
-The factor multiplies the strength you already chose, so relative intent
-between rows survives. It is clamped to ≤ 1 (trim only). Distillation adapters
-are quiet on purpose and stay at ×1.00.
+The factor multiplies the strength you already chose — or the preset the LoRA
+Manager holds for that model — so relative intent between rows survives. It is
+clamped to ≤ 1 (trim only). Distillation adapters are quiet on purpose and stay
+at ×1.00.
 
 `dW` is never formed. `||B A||_F^2 = tr((B^T B)(A A^T))` uses r×r matrices.
 Results cache on (path, mtime, size). LoKr: `||W1 ⊗ W2||_F = ||W1||_F · ||W2||_F`.
@@ -217,10 +253,11 @@ AdaLN does split: `AdalnProj` emits three contiguous blocks of 32256 rows
 (`{video: 0, text: 1, audio: 2}`). Scaling a slice of `lora_B` scales that
 modality's modulation with no runtime hook.
 
-Wire **MiniMax H3 adaLN Modality** into `adaln_modality`. All three at 1.0 is a
-no-op; 0.0 removes that modality's share. Scaling runs *before* AdaLN porting
-so `.diff_b` inherits it. Geometry is read off the loaded `AdalnProj`;
-`final_layer.adaln_proj` is one-modality and is left alone.
+The `adaln_video` / `adaln_text` / `adaln_audio` widgets do that for every
+stacked LoRA at once. All three at 1.0 is a no-op; 0.0 removes that modality's
+share. Scaling runs *before* AdaLN porting so `.diff_b` inherits it. Geometry is
+read off the loaded `AdalnProj`; `final_layer.adaln_proj` is one-modality and is
+left alone.
 
 Where AdaLN is present it is not a marginal knob: 89–99.7% of weight-space
 perturbation for content LoRAs (median ~96%), 16–23% for curve8 turbo
@@ -260,6 +297,9 @@ auto-balance would have used.
   streaming loader in `minimaxh3chinkloader` uses its own handle and LoRA path.
 - DoRA, LoHa, LoKr and locon merge in `auto`; `branch` rejects them (only plain
   rank decompositions have the runtime branch path).
+- Per-row denoising schedules are not exposed here — they needed a second node,
+  and this pack is deliberately one. Acc/PDD head blending still follows the
+  sampler.
 
 </details>
 
@@ -269,15 +309,17 @@ auto-balance would have used.
 From the ComfyUI root:
 
 ```powershell
-$env:PYTHONPATH = "custom_nodes/ComfyUI-H3-PowerLoraStack;."
-python -m pytest custom_nodes/ComfyUI-H3-PowerLoraStack/tests --import-mode=importlib -q
+$env:PYTHONPATH = "custom_nodes/ComfyUI-H3-PowerLoraManagerStack;."
+python -m pytest custom_nodes/ComfyUI-H3-PowerLoraManagerStack/tests --import-mode=importlib -q
 ```
 
+`python -m unittest discover -s tests -t tests` works too, from the pack root.
 CPU paths are covered; the mixed-device check skips without CUDA.
-`node --check web/h3_power_lora_stack.js` validates the frontend.
+`node --check web/h3_power_lora_manager_stack.js` validates the frontend.
 
 Requires Python 3.10+ and a ComfyUI revision with MiniMax H3,
-`QuantizedTensor`, weight adapters, and patcher wrappers.
+`QuantizedTensor`, weight adapters, and patcher wrappers. ComfyUI-Lora-Manager
+is optional.
 
 </details>
 

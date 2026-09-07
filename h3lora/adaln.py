@@ -362,11 +362,11 @@ class AdalnContext:
     def _record(self, v, c, residual, source):
         if not _accept(residual):
             LOG.warning(
-                "H3 PowerLoraStack: adaLN basis from %s residual %.2e exceeds %.0e",
+                "H3 PowerLoraManagerStack: adaLN basis from %s residual %.2e exceeds %.0e",
                 source, residual, MAX_RESIDUAL,
             )
             return None
-        LOG.info("H3 PowerLoraStack: adaLN basis from %s, residual %.2e", source, residual)
+        LOG.info("H3 PowerLoraManagerStack: adaLN basis from %s, residual %.2e", source, residual)
         self._basis = (v, c, residual)
         self.residual = residual
         self.source = source
@@ -441,7 +441,7 @@ class AdalnContext:
             try:
                 got = self._fit_grid(table, load_silu_grid(self.grid_path), self.grid_path)
             except Exception as exc:
-                LOG.warning("H3 PowerLoraStack: could not load silu grid (%s)", exc)
+                LOG.warning("H3 PowerLoraManagerStack: could not load silu grid (%s)", exc)
 
         if got is None and table is not None:
             got = self._scan_grids(table)
@@ -458,7 +458,7 @@ class AdalnContext:
         if got is None:
             if not self._failed:
                 LOG.warning(
-                    "H3 PowerLoraStack: adaLN porting unavailable - no baked basis, "
+                    "H3 PowerLoraManagerStack: adaLN porting unavailable - no baked basis, "
                     "silu grid, live time embedder, or matching diffusion_models bake"
                 )
                 self._failed = True
@@ -503,12 +503,12 @@ def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None, mode="auto"
                 table_map = (m, a_const)
                 stats["residual"] = residual
                 table_map_failed = False
-                LOG.info("H3 PowerLoraStack: adaLN table-to-table fit residual %.2e", residual)
+                LOG.info("H3 PowerLoraManagerStack: adaLN table-to-table fit residual %.2e", residual)
             else:
-                LOG.warning("H3 PowerLoraStack: adaLN table-to-table fit residual %.2e exceeds %.0e",
+                LOG.warning("H3 PowerLoraManagerStack: adaLN table-to-table fit residual %.2e exceeds %.0e",
                             residual, MAX_RESIDUAL)
         except Exception as exc:
-            LOG.warning("H3 PowerLoraStack: adaLN table rebase unavailable (%s)", exc)
+            LOG.warning("H3 PowerLoraManagerStack: adaLN table rebase unavailable (%s)", exc)
 
     out = dict(sd)
     basis = None
@@ -529,7 +529,7 @@ def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None, mode="auto"
         a = sd[a_key]
         b = sd[b_key]
         if a.ndim != 2 or b.ndim != 2 or b.shape[1] != a.shape[0]:
-            LOG.warning("H3 PowerLoraStack: malformed adaLN pair %s, skipped", module)
+            LOG.warning("H3 PowerLoraManagerStack: malformed adaLN pair %s, skipped", module)
             for key in parts.values():
                 out.pop(key, None)
             stats["skipped"] += 1
@@ -575,7 +575,7 @@ def port_adaln_pairs(sd: dict, ctx: AdalnContext, source_table=None, mode="auto"
                 sign = -1.0
             else:
                 LOG.warning(
-                    "H3 PowerLoraStack: adaLN pair %s has width %d, expected %d or %d - skipped",
+                    "H3 PowerLoraManagerStack: adaLN pair %s has width %d, expected %d or %d - skipped",
                     module, source_dim, v.shape[0], v.shape[1],
                 )
                 for key in parts.values():

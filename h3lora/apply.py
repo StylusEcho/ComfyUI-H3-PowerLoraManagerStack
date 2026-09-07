@@ -22,7 +22,7 @@ from . import pdd as pdd_mod
 from . import schedule as schedule_mod
 from . import sidecars as sidecar_mod
 
-LOG = logging.getLogger("h3.powerlorastack")
+LOG = logging.getLogger("h3.powerloramanagerstack")
 sidecar_mod.ensure_load_hook()
 
 # Layers whose forward is bypassed by a fused kernel, per weight layout.  A
@@ -155,7 +155,7 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
         upstream = adaln_mod.upstream_adaln_fix_warning(model)
         if upstream:
             report.add(upstream)
-            LOG.warning("H3 PowerLoraStack:\n%s", upstream)
+            LOG.warning("H3 PowerLoraManagerStack:\n%s", upstream)
     if adaln_ctx is not None and table is not None:
         adaln_ctx.basis()
         if adaln_ctx.source:
@@ -168,7 +168,7 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             patcher, attached = adaln_mod.port_attached_patches(
                 patcher, adaln_ctx, mode=adaln_mode)
         except Exception as exc:
-            LOG.exception("H3 PowerLoraStack: incoming adaLN port failed")
+            LOG.exception("H3 PowerLoraManagerStack: incoming adaLN port failed")
             report.add(f"  ! incoming adaLN port failed ({exc}); left upstream patches")
         else:
             if attached["ported"] or attached["stripped"] or attached["unportable"]:
@@ -236,7 +236,7 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
                     normalized, adaln_ctx, source_table=source_table,
                     mode=adaln_mode)
             except Exception as exc:
-                LOG.exception("H3 PowerLoraStack: adaLN port failed for %s", name)
+                LOG.exception("H3 PowerLoraManagerStack: adaLN port failed for %s", name)
                 report.add(f"{name}: adaLN port failed ({exc}); pairs left as-is")
                 stats = {"ported": 0, "skipped": 0, "ok": 0, "rebased": 0, "residual": None}
             if stats["ported"]:
@@ -282,7 +282,7 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             weight = _module_weight(patcher, module_path)
             if (not torch.is_tensor(candidate) or weight is None
                     or tuple(candidate.shape) != tuple(weight.shape)):
-                LOG.warning("H3 PowerLoraStack: shape mismatch on %s, skipped", weight_key)
+                LOG.warning("H3 PowerLoraManagerStack: shape mismatch on %s, skipped", weight_key)
                 report.skipped += 1
                 skipped_here += 1
                 merge.pop(weight_key, None)
@@ -296,7 +296,7 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
             weight = _module_weight(patcher, module_path)
             if (not torch.is_tensor(candidate) or weight is None
                     or candidate.ndim != 1 or candidate.shape[0] != weight.shape[0]):
-                LOG.warning("H3 PowerLoraStack: shape mismatch on %s, skipped", bias_key)
+                LOG.warning("H3 PowerLoraManagerStack: shape mismatch on %s, skipped", bias_key)
                 report.skipped += 1
                 skipped_here += 1
                 merge.pop(bias_key, None)
@@ -312,7 +312,7 @@ def apply_stack(model, entries, mode="auto", adaln_mode="auto", grid_path="",
                     or up.ndim != 2 or down.ndim != 2 or up.shape[1] != down.shape[0]
                     or weight is None or up.shape[0] != weight.shape[0]
                     or down.shape[1] != weight.shape[1]):
-                LOG.warning("H3 PowerLoraStack: shape mismatch on %s, skipped", weight_key)
+                LOG.warning("H3 PowerLoraManagerStack: shape mismatch on %s, skipped", weight_key)
                 report.skipped += 1
                 skipped_here += 1
                 merge.pop(weight_key, None)

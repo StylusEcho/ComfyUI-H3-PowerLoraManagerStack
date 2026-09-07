@@ -27,7 +27,7 @@ from comfy.ldm.minimax.model import _mod_row, time_shift_sigma
 from comfy.patcher_extension import WrappersMP
 from .schedule import progress_from
 
-LOG = logging.getLogger("h3.powerlorastack")
+LOG = logging.getLogger("h3.powerloramanagerstack")
 
 _VIDEO_WEIGHT = (
     "diffusion_model.final_layer.video_out.set_weight",
@@ -109,11 +109,11 @@ def peel(sd, video_dim, audio_dim, hidden):
     audio = _as_bank(aw, audio_dim) if aw is not None else None
     notes = []
     if video is None and vw is not None:
-        LOG.warning("H3 PowerLoraStack: ignored %s shape %s (native video head is %d)",
+        LOG.warning("H3 PowerLoraManagerStack: ignored %s shape %s (native video head is %d)",
                     vw_key, tuple(vw.shape), video_dim)
         notes.append("video weight dropped")
     if audio is None and aw is not None:
-        LOG.warning("H3 PowerLoraStack: ignored %s shape %s (native audio head is %d)",
+        LOG.warning("H3 PowerLoraManagerStack: ignored %s shape %s (native audio head is %d)",
                     aw_key, tuple(aw.shape), audio_dim)
         notes.append("audio weight dropped")
     if video is None and audio is None:

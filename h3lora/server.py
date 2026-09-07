@@ -12,13 +12,18 @@ import logging
 
 from . import gain
 
-LOG = logging.getLogger("h3.powerlorastack")
+LOG = logging.getLogger("h3.powerloramanagerstack")
 
-ROUTE = "/h3_power_lora_stack/balance"
+ROUTE = "/h3_power_lora_manager_stack/balance"
 
 
-def measure_names(names):
-    """``[lora_name]`` -> ``{lora_name: {rel, factor, layers, note}}``.
+def measure_names(rows):
+    """``[name | {name, path}]`` -> ``{name: {rel, factor, layers, note}}``.
+
+    A row picked in the search bar carries the absolute path the LoRA Manager
+    reported for it, which is the only way to measure a library that lives
+    outside ``models/loras``.  Bare strings are still accepted so the route
+    stays usable without the manager.
 
     Imported lazily by the route so the module stays importable without a
     running server (the calibration scripts use it directly).
@@ -27,10 +32,15 @@ def measure_names(names):
 
     out = {}
     seen: dict[str, str] = {}
-    for name in names:
-        if not name or name == "None" or name in out:
+    for row in rows:
+        if isinstance(row, dict):
+            name = row.get("name")
+            manager_path = row.get("path")
+        else:
+            name, manager_path = row, None
+        if not isinstance(name, str) or not name or name == "None" or name in out:
             continue
-        path = _resolve_lora(name)
+        path = _resolve_lora(name, manager_path if isinstance(manager_path, str) else None)
         if path is None:
             out[name] = {"rel": None, "factor": 1.0, "layers": 0,
                          "note": "not found"}
@@ -77,13 +87,13 @@ def register():
             body = await request.json()
         except Exception:
             return web.json_response({"error": "bad request"}, status=400)
-        names = body.get("loras")
-        if not isinstance(names, list):
+        rows = body.get("loras")
+        if not isinstance(rows, list):
             return web.json_response({"error": "expected {'loras': [...]}"}, status=400)
         try:
-            results = measure_names([n for n in names if isinstance(n, str)])
+            results = measure_names([r for r in rows if isinstance(r, (str, dict))])
         except Exception as exc:
-            LOG.exception("H3 Power LoRA Stack: balance failed")
+            LOG.exception("H3 Power LoRA Stack (LoRA Manager): balance failed")
             return web.json_response({"error": str(exc)}, status=500)
         return web.json_response({
             "results": results,

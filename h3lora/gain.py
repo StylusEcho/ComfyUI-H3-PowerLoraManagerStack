@@ -43,7 +43,7 @@ import torch
 
 from . import keymap
 
-LOG = logging.getLogger("h3.powerlorastack")
+LOG = logging.getLogger("h3.powerloramanagerstack")
 
 # Median RMS of the base weights per module group, i.e. ||W||_F / sqrt(out*in).
 # Measured over all 260 2-D layers of a local h3 fl2va pruned int8 convrot bake.
