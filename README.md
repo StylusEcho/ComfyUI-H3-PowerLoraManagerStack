@@ -13,7 +13,9 @@ This is an alternative build of the
 [MiniMax H3 Power LoRA Stack](https://github.com/cicalooo/ComfyUI-H3-PowerLoraStack).
 It registers under its own node id (`H3PowerLoraManagerStack`), its own web
 extension and its own HTTP route, so it can sit next to that pack in the same
-ComfyUI install without either one shadowing the other.
+ComfyUI install without either one shadowing the other — and it takes that
+pack's **adaLN Modality** and **LoRA Schedule** nodes on its own inputs, so
+nothing that needed them is lost by there being one node here.
 
 ## The node
 
@@ -23,6 +25,8 @@ ComfyUI install without either one shadowing the other.
 | `quantized_layers` | `auto` / `branch` / `merge` |
 | `adaln_port` | `auto` / `strip` / `off` |
 | `adaln_video` `adaln_text` `adaln_audio` | Per-modality adaLN scaling; all three at 1.0 is a no-op |
+| `adaln_modality` | Optional `H3_MODALITY`, from **MiniMax H3 adaLN Modality** — wins over the three widgets |
+| `schedule` | Optional `H3_SCHEDULE` chain, from **MiniMax H3 LoRA Schedule** |
 | `lora_stack` | Optional `LORA_STACK`, e.g. from **Lora Stacker (LoraManager)** |
 
 | Output | |
@@ -34,6 +38,14 @@ ComfyUI install without either one shadowing the other.
 Rows themselves are added in the browser: **🔍 Add LoRA** opens the search bar,
 each row gets a toggle, a strength and a remove button, and there is no limit on
 how many.
+
+`adaln_modality` and `schedule` are the outputs of two nodes in the original
+pack. ComfyUI matches links by type name, so installing that pack next to this
+one is all the wiring there is. Leave them unconnected and the node is
+self-contained: the three adaLN widgets cover modality, and rows run at their
+static strength. Wiring `adaln_modality` overrides those widgets — and if they
+were not left at 1.0, the report says so rather than dropping the setting
+quietly.
 
 ## The LoRA Manager connection
 
@@ -183,9 +195,6 @@ interpolates between native and blended heads. Use `simple` at 8 steps with
 shifts 12/3 so steps land on the trained grid. Later stack rows that also carry
 a bank replace the earlier one.
 
-The stack reads `sample_sigmas` from ComfyUI, so a plain KSampler works with no
-SIGMAS wire.
-
 </details>
 
 <details>
@@ -205,6 +214,34 @@ Entries arriving on `lora_stack` are applied ahead of this node's own rows, so a
 **Lora Stacker (LoraManager)** chain can feed straight in. CLIP strengths on
 those entries are ignored rather than folded into the model strength — H3 has no
 CLIP tower on this path.
+
+</details>
+
+<details>
+<summary>Denoising schedules</summary>
+
+Wire the original pack's **MiniMax H3 LoRA Schedule** into `schedule`. Select
+rows with `all`, `1,3`, or `2-4`, then a linear, cosine, smoothstep, power, step
+or explicit curve. `start_percent` / `end_percent` limit the transition. Chain
+schedule nodes; the later node wins where selectors overlap.
+
+`steps` follows model-call indices. `sigma` follows the scheduler's normalized
+noise. The stack reads `sample_sigmas` from ComfyUI; plain KSampler works, no
+SIGMAS wire.
+
+Row numbers are this node's own rows, counted top to bottom. Entries arriving
+on `lora_stack` are not rows you can see or number, so they are reachable by
+`all` and by nothing else.
+
+Scheduled rows always use the live branch path, including on unquantized
+bases. Anything that cannot branch is merged at the row's static strength and
+called out in the report. Ported AdaLN bias deltas follow their LoRA rather
+than staying fixed.
+
+Schedule links cross the pack boundary by shape, not by class: ComfyUI imports
+each pack under its own name, so the other pack's `Schedule` is a different
+class built from the same source. Links are recognised by carrying `matches`,
+which is what lets that node drive these rows.
 
 </details>
 
@@ -254,10 +291,11 @@ AdaLN does split: `AdalnProj` emits three contiguous blocks of 32256 rows
 modality's modulation with no runtime hook.
 
 The `adaln_video` / `adaln_text` / `adaln_audio` widgets do that for every
-stacked LoRA at once. All three at 1.0 is a no-op; 0.0 removes that modality's
-share. Scaling runs *before* AdaLN porting so `.diff_b` inherits it. Geometry is
-read off the loaded `AdalnProj`; `final_layer.adaln_proj` is one-modality and is
-left alone.
+stacked LoRA at once, and the original pack's **MiniMax H3 adaLN Modality** node
+does the same thing over the `adaln_modality` input — wired, it wins. All three
+at 1.0 is a no-op; 0.0 removes that modality's share. Scaling runs *before*
+AdaLN porting so `.diff_b` inherits it. Geometry is read off the loaded
+`AdalnProj`; `final_layer.adaln_proj` is one-modality and is left alone.
 
 Where AdaLN is present it is not a marginal knob: 89–99.7% of weight-space
 perturbation for content LoRAs (median ~96%), 16–23% for curve8 turbo
@@ -297,9 +335,8 @@ auto-balance would have used.
   streaming loader in `minimaxh3chinkloader` uses its own handle and LoRA path.
 - DoRA, LoHa, LoKr and locon merge in `auto`; `branch` rejects them (only plain
   rank decompositions have the runtime branch path).
-- Per-row denoising schedules are not exposed here — they needed a second node,
-  and this pack is deliberately one. Acc/PDD head blending still follows the
-  sampler.
+- `adaln_modality` and `schedule` have nothing to connect to unless the original
+  Power LoRA Stack pack is installed; the sockets are simply unused until then.
 
 </details>
 

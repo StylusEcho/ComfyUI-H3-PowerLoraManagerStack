@@ -190,12 +190,14 @@ def _collect_lora_stack(lora_stack, issues):
             LOG.warning("H3 PowerLoraManagerStack: %s", message)
             issues.append(message)
             continue
-        # No ``row``: these are not stack rows, so they take their position in
-        # the applied order rather than a row number the UI could refer to.
+        # Zero and down: an H3 LoRA Schedule selector only parses one-based row
+        # numbers, so these can be swept up by ``all`` but never picked out by a
+        # number that means one of this node's own visible rows.
         entries.append({
             "name": os.path.basename(str(name)),
             "path": path,
             "strength": model_strength,
+            "row": -offset,
             "trigger_words": None,
         })
     return entries
@@ -240,6 +242,10 @@ class H3PowerLoraManagerStack:
     the library's names, previews, base models and trigger words are what you
     pick from.  Without the manager installed the search bar falls back to
     ``models/loras`` and the node behaves like an ordinary stack.
+
+    The ``adaln_modality`` and ``schedule`` inputs take the MiniMax H3 adaLN
+    Modality and H3 LoRA Schedule nodes from the original Power LoRA Stack pack,
+    which this node is meant to be installed beside.
     """
 
     @classmethod
@@ -272,6 +278,18 @@ class H3PowerLoraManagerStack:
                 "adaln_audio": ("FLOAT", dict(modality, tooltip=(
                     "Scale every stacked LoRA's adaLN modulation for the audio modality "
                     "(tag 2)."))),
+                "adaln_modality": ("H3_MODALITY", {
+                    "tooltip": "Optional. A MiniMax H3 adaLN Modality node -- from the "
+                               "original Power LoRA Stack pack -- wired here scales every "
+                               "stacked LoRA's adaLN modulation per modality. It takes "
+                               "precedence over the adaln_video/text/audio widgets above.",
+                }),
+                "schedule": ("H3_SCHEDULE", {
+                    "tooltip": "Optional. An H3 LoRA Schedule chain -- from the original "
+                               "Power LoRA Stack pack -- varies selected row strengths over "
+                               "the denoising trajectory. Rows are this node's own, numbered "
+                               "top to bottom; lora_stack entries are only reached by 'all'.",
+                }),
                 "lora_stack": ("LORA_STACK", {
                     "tooltip": "Optional. A LORA_STACK from Lora Stacker (LoraManager) or any "
                                "other stacker; its entries are applied ahead of this node's "
@@ -295,7 +313,7 @@ class H3PowerLoraManagerStack:
 
     def apply(self, model=None, quantized_layers="auto", adaln_port="auto",
               adaln_video=1.0, adaln_text=1.0, adaln_audio=1.0,
-              lora_stack=None, **kwargs):
+              adaln_modality=None, schedule=None, lora_stack=None, **kwargs):
         if model is None:
             raise ValueError("H3 Power LoRA Stack (LoRA Manager): no model connected")
 
@@ -304,15 +322,20 @@ class H3PowerLoraManagerStack:
         # Upstream stack entries land ahead of this node's rows, matching how a
         # chain of stackers reads on the canvas.
         entries = _collect_lora_stack(lora_stack, issues) + rows
-        modality = {
+        widgets = {
             "video": float(adaln_video),
             "text": float(adaln_text),
             "audio": float(adaln_audio),
         }
+        # One wired node beats three widgets -- but never silently: a setting on
+        # the widgets that the wire discards is called out in the report.
+        modality = widgets if adaln_modality is None else adaln_modality
+        overridden = adaln_modality is not None and any(
+            value != 1.0 for value in widgets.values())
         try:
             patcher, report = apply_mod.apply_stack(
                 model, entries, mode=quantized_layers, adaln_mode=adaln_port,
-                modality=modality,
+                modality=modality, schedule=schedule,
             )
         except Exception as exc:
             LOG.exception("H3 Power LoRA Stack (LoRA Manager) failed; "
@@ -323,6 +346,9 @@ class H3PowerLoraManagerStack:
         text = report.text()
         if not entries and not text.strip():
             text = "no LoRAs enabled"
+        if overridden:
+            text += ("\n  ! adaln_modality is wired, so the node's own "
+                     "adaln_video/text/audio widgets were ignored")
         if issues:
             text = text + ("\n" if text else "") + "\n".join(issues)
             # A row that will not resolve is the one moment the optional

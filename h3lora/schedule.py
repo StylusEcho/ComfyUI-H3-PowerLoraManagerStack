@@ -107,13 +107,21 @@ class Schedule:
 
 
 def resolve(chain, row_index: int) -> Schedule | None:
-    """Return the last schedule link selecting this one-based stack row."""
+    """Return the last schedule link selecting this one-based stack row.
+
+    A chain arrives over a node socket, so its links need not be *this* module's
+    ``Schedule``: the H3 LoRA Schedule node in the original Power LoRA Stack
+    pack builds the same frozen dataclass under its own import name, and two
+    copies of a class are not the same class.  Links are therefore recognised by
+    carrying ``matches``, not by ``isinstance``, so a schedule from that pack
+    drives this node's rows.
+    """
     if chain is None:
         return None
-    links = (chain,) if isinstance(chain, Schedule) else chain
+    links = chain if isinstance(chain, (tuple, list)) else (chain,)
     result = None
     for item in links:
-        if item.matches(row_index):
+        if callable(getattr(item, "matches", None)) and item.matches(row_index):
             result = item
     return result
 
