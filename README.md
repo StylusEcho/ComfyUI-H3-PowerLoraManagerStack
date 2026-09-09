@@ -38,6 +38,12 @@ Rows themselves are added in the browser: **🔍 Add LoRA** opens the search bar
 each row gets a toggle, a strength and a remove button, and there is no limit on
 how many.
 
+Drag a row by the grip on its left to reorder it — or right-click the row for
+**Move up / down / to top / to bottom**. Order is not cosmetic: it is the order
+the LoRAs are applied, and it is what an H3 LoRA Schedule's `1,3` and `2-4` row
+selectors address. A row keeps its strength and its auto-balance measurement
+when it moves.
+
 `adaln_modality` and `schedule` are the outputs of two nodes in the original
 pack. ComfyUI matches links by type name, so installing that pack next to this
 one is all the wiring there is. Left unconnected they simply do nothing: adaLN
@@ -49,9 +55,14 @@ With ComfyUI-Lora-Manager installed, the search bar queries the library live:
 
 - **Search** across file name, the creator's model name and tags, fuzzy, so
   `turbo` finds a LoRA whose file is named after its hash.
-- **Filter** by base model, or to your favourites.
+- **Filter** by base model, by folder, or to your favourites. A folder includes
+  everything under it, so `styles` also finds `styles/anime`. The three stick
+  between openings — they are remembered in the browser rather than in the
+  workflow, so a workflow you share does not carry your library's folder names
+  to someone whose library has no such folder.
 - Results carry the manager's **preview, model name, version and base model**,
   and picking one adopts the **strength preset** saved on that model.
+- **Hover** a result — or a row on the node — for the full-size preview.
 - The row keeps the **trigger words** the manager holds, which is what feeds the
   `trigger_words` output.
 - The footer links through to the manager's own library page.
@@ -348,7 +359,18 @@ python -m pytest custom_nodes/ComfyUI-H3-PowerLoraManagerStack/tests --import-mo
 
 `python -m unittest discover -s tests -t tests` works too, from the pack root.
 CPU paths are covered; the mixed-device check skips without CUDA.
-`node --check web/h3_power_lora_manager_stack.js` validates the frontend.
+
+The frontend has a syntax gate and a small suite for the logic that does not
+need a canvas — where a dragged row lands, and that a picker filter survives a
+round trip through browser storage:
+
+```
+node --check web/h3_power_lora_manager_stack.js
+node --test tests/js/*.test.mjs
+```
+
+Both run on plain Node with no dependencies. Drawing, dragging and hovering
+need a real browser and are not covered.
 
 Requires Python 3.10+ and a ComfyUI revision with MiniMax H3,
 `QuantizedTensor`, weight adapters, and patcher wrappers. ComfyUI-Lora-Manager

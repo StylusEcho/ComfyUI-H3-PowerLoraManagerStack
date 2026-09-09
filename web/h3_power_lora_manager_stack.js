@@ -23,8 +23,38 @@ const LM = {
   health: "/lm/health-check",
   list: "/lm/loras/list",
   baseModels: "/lm/loras/base-models",
+  folders: "/lm/loras/folders",
   page: "/loras",
 };
+
+/* --------------------------------------------------------- picker prefs -- */
+
+// The filter bar's settings live in the browser, not in the workflow: they are
+// how *you* browse your library, and baking a folder name into a saved workflow
+// would hand it to someone whose library has no such folder.  Deliberately not
+// the manager's own `lora_manager_*` keys -- those are its page's state, with
+// its own shape, and are not ours to write.
+const PREFS_KEY = "h3lm.picker.filters";
+
+/** Stored filter bar state, or an empty object if storage is unavailable. */
+function readPrefs() {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (err) {
+    // private windows and "block site data" both throw on access
+    return {};
+  }
+}
+
+function writePrefs(patch) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ ...readPrefs(), ...patch }));
+  } catch (err) {
+    /* filters just will not stick; not worth telling anyone about */
+  }
+}
 
 /** A non-API URL (a page, or a preview the manager handed us) under api_base. */
 function siteUrl(path) {
@@ -60,8 +90,8 @@ async function managerAvailable() {
  * name, the creator's model name and the tags, so "turbo" finds a LoRA whose
  * file is named after its hash.
  */
-async function managerSearch(query, { baseModel = "", favorites = false, limit = 60,
-                                      signal } = {}) {
+async function managerSearch(query, { baseModel = "", folder = "", favorites = false,
+                                      limit = 60, signal } = {}) {
   const params = new URLSearchParams({
     page: "1",
     page_size: String(limit),
@@ -73,6 +103,13 @@ async function managerSearch(query, { baseModel = "", favorites = false, limit =
   });
   if (query) params.set("search", query);
   if (baseModel) params.set("base_model", baseModel);
+  if (folder) {
+    // With recursive (the manager's own default) `folder` matches the folder
+    // and everything under it, so picking `styles` also finds `styles/anime`.
+    // An empty folder is left off entirely -- server-side it is a no-op.
+    params.set("folder", folder);
+    params.set("recursive", "true");
+  }
   if (favorites) params.set("favorites_only", "true");
   const res = await api.fetchApi(`${LM.list}?${params}`, { signal });
   if (!res.ok) throw new Error(`LoRA Manager search failed (${res.status})`);
@@ -90,6 +127,26 @@ async function managerBaseModels() {
     return (data?.base_models ?? [])
       .map((entry) => (typeof entry === "string" ? entry : entry?.name))
       .filter(Boolean);
+  } catch (err) {
+    return [];
+  }
+}
+
+/**
+ * Every folder the library holds, as root-relative paths.
+ *
+ * Shaped unlike the base-model endpoint: plain strings under a `folders` key
+ * with no `success` flag, and an empty string for the library root -- which is
+ * dropped here, since "root" as a filter is spelled "any folder".
+ */
+async function managerFolders() {
+  try {
+    const res = await api.fetchApi(LM.folders);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data?.folders ?? [])
+      .map((entry) => (typeof entry === "string" ? entry : entry?.name))
+      .filter((name) => typeof name === "string" && name !== "");
   } catch (err) {
     return [];
   }
@@ -236,6 +293,219 @@ function drawThumb(ctx, image, x, y, size) {
   ctx.restore();
 }
 
+/* --------------------------------------------------------- hover preview -- */
+
+// One tooltip for the whole page, built on first use.  Unlike the manager's --
+// which re-fetches /lm/loras/preview-url on every hover -- this needs no request
+// at all: rows and search results already carry the preview URL the manager gave
+// us when the LoRA was picked.
+const HOVER_DELAY = 400;
+const TIP_FADE = 150;
+const TIP_LOAD_TIMEOUT = 1000;
+
+let tipEl = null;
+let tipShowTimer = null;
+let tipHideTimer = null;
+let tipUrl = null;      // what is on screen
+let tipPending = null;  // what the delay is counting down towards
+let tipAnchor = { x: 0, y: 0 };
+
+function ensureTip() {
+  if (tipEl) return tipEl;
+  ensurePickerCss();
+  tipEl = document.createElement("div");
+  tipEl.className = "h3lm-tip";
+  document.body.appendChild(tipEl);
+  // A click or any scroll means the pointer is no longer telling us about the
+  // thing under it.  Capture phase so a scroller that stops propagation still
+  // dismisses the preview.
+  document.addEventListener("click", hideTip);
+  document.addEventListener("scroll", hideTip, true);
+  return tipEl;
+}
+
+function positionTip(x, y) {
+  const rect = tipEl.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let left = x + 14;
+  let top = y + 14;
+  if (left + rect.width > vw) left = x - rect.width - 14;
+  if (top + rect.height > vh) top = y - rect.height - 14;
+  tipEl.style.left = `${Math.max(10, Math.min(left, vw - rect.width - 10))}px`;
+  tipEl.style.top = `${Math.max(10, Math.min(top, vh - rect.height - 10))}px`;
+}
+
+/** Resolve once the media has painted, or give up so the tooltip still shows. */
+function whenLoaded(media, isVideo) {
+  return new Promise((resolve) => {
+    if (isVideo ? media.readyState >= 2 : media.complete) return resolve();
+    media.addEventListener(isVideo ? "loadeddata" : "load", resolve, { once: true });
+    media.addEventListener("error", resolve, { once: true });
+    setTimeout(resolve, TIP_LOAD_TIMEOUT);
+  });
+}
+
+async function showTip(url, label, x, y) {
+  if (!url) return;
+  const el = ensureTip();
+  clearTimeout(tipHideTimer);
+  tipHideTimer = null;
+
+  // already up for this LoRA: follow the pointer instead of rebuilding
+  if (tipUrl === url && el.style.display === "block") return positionTip(x, y);
+  tipUrl = url;
+
+  const isVideo = isVideoPreview(url);
+  const media = document.createElement(isVideo ? "video" : "img");
+  media.className = "h3lm-tip-media";
+  if (isVideo) {
+    media.autoplay = true;
+    media.loop = true;
+    media.muted = true;
+    media.controls = false;
+  }
+  el.replaceChildren(media);
+  if (label) {
+    const caption = document.createElement("div");
+    caption.className = "h3lm-tip-name";
+    caption.textContent = label;
+    el.appendChild(caption);
+  }
+
+  // Displayed but transparent so it can be measured, then positioned against
+  // the media's real size once it has loaded, then faded in.
+  el.style.opacity = "0";
+  el.style.display = "block";
+  media.src = siteUrl(url);
+  await whenLoaded(media, isVideo);
+  if (tipUrl !== url) return;        // a different row won the race
+  requestAnimationFrame(() => {
+    if (tipUrl !== url) return;
+    positionTip(x, y);
+    el.style.opacity = "1";
+  });
+}
+
+function hideTip() {
+  clearTimeout(tipShowTimer);
+  tipShowTimer = null;
+  tipPending = null;
+  if (!tipEl || tipEl.style.display !== "block") return;
+  tipEl.style.opacity = "0";
+  tipUrl = null;
+  clearTimeout(tipHideTimer);
+  tipHideTimer = setTimeout(() => {
+    tipEl.style.display = "none";
+    // a hidden preview has no business still decoding
+    const video = tipEl.querySelector("video");
+    if (video) video.pause();
+    tipHideTimer = null;
+  }, TIP_FADE);
+}
+
+/**
+ * Hover intent, safe to call on every pointer move.
+ *
+ * The node's rows are hovered through `onMouseMove`, which fires continuously,
+ * so the delay must not restart on each pixel -- it counts down once per LoRA
+ * and the pointer position it eventually uses is wherever the pointer got to.
+ */
+function scheduleTip(url, label, x, y) {
+  tipAnchor = { x, y };
+  if (!url) return hideTip();
+  if (tipUrl === url) return void showTip(url, null, x, y);   // up: follow along
+  if (tipPending === url) return;                             // already counting
+  clearTimeout(tipShowTimer);
+  tipPending = url;
+  tipShowTimer = setTimeout(
+    () => showTip(url, label, tipAnchor.x, tipAnchor.y), HOVER_DELAY);
+}
+
+/* ------------------------------------------------------------ reordering -- */
+
+// Cumulative distance from the press, not a per-event delta: the manager tests
+// `e.movementY` per event, which means a slow drag never crosses its threshold
+// and the drop is silently discarded.
+const DRAG_THRESHOLD = 3;
+
+// Live drag, read by every row's draw() so the dragged row can dim and the drop
+// line can be painted at the insertion point.
+let dragState = null;
+
+/** Move a row to `toIndex` among the node's rows, keeping its whole value. */
+function moveRow(node, widget, toIndex) {
+  const rows = loraWidgets(node);
+  const from = rows.indexOf(widget);
+  if (from < 0) return false;
+  const target = Math.max(0, Math.min(rows.length - 1, toIndex));
+  if (target === from) return false;
+  // Anchor on the widget currently holding the target slot rather than doing
+  // index arithmetic: after the removal it is still the right neighbour, so
+  // there is no off-by-one to get wrong when moving down.
+  const anchor = rows[target];
+  node.widgets.splice(node.widgets.indexOf(widget), 1);
+  const at = node.widgets.indexOf(anchor);
+  node.widgets.splice(target > from ? at + 1 : at, 0, widget);
+  // renumber() is what keeps lora_N dense and in order, which is the order the
+  // Python side sorts rows by -- and what a schedule's "1,3" addresses.
+  renumber(node);
+  resize(node);
+  node.setDirtyCanvas(true, true);
+  return true;
+}
+
+/**
+ * Drag a row by its grip.
+ *
+ * LiteGraph is not relied on to forward pointermove/pointerup into a widget's
+ * `mouse()` callback, so the drag listens on `document` for the duration --
+ * the same effect as the manager's `setPointerCapture`, without depending on
+ * canvas widget event plumbing.  Everything is measured in graph space, so the
+ * drop lands where the indicator says at any zoom.
+ */
+function startRowDrag(node, widget, event) {
+  const fromIndex = loraWidgets(node).indexOf(widget);
+  if (fromIndex < 0) return;
+  hideTip();
+  const startY = event.clientY;
+  dragState = { node, widget, fromIndex, toIndex: fromIndex, moved: false };
+
+  const onMove = (e) => {
+    if (!dragState) return;
+    const dy = e.clientY - startY;
+    if (!dragState.moved && Math.abs(dy) < DRAG_THRESHOLD) return;
+    dragState.moved = true;
+    const scale = app.canvas?.ds?.scale || 1;
+    const steps = Math.round(dy / scale / ROW_HEIGHT);
+    const count = loraWidgets(node).length;
+    dragState.toIndex = Math.max(0, Math.min(count - 1, fromIndex + steps));
+    node.setDirtyCanvas(true, true);
+  };
+
+  const onUp = () => {
+    document.removeEventListener("pointermove", onMove, true);
+    document.removeEventListener("pointerup", onUp, true);
+    document.removeEventListener("pointercancel", onUp, true);
+    const finished = dragState;
+    dragState = null;
+    if (!finished) return;
+    if (finished.moved) moveRow(node, widget, finished.toIndex);
+    else node.setDirtyCanvas(true, true);
+  };
+
+  document.addEventListener("pointermove", onMove, true);
+  document.addEventListener("pointerup", onUp, true);
+  document.addEventListener("pointercancel", onUp, true);
+}
+
+/** The row under a node-local Y, using the Y each row recorded as it drew. */
+function rowAtNodeY(node, localY) {
+  return loraWidgets(node).find(
+    (w) => w.lastY !== undefined && localY >= w.lastY && localY < w.lastY + w.lastH
+  );
+}
+
 function shortName(name) {
   if (!name || name === "None") return "click to choose";
   const base = String(name).replace(/\\/g, "/").split("/").pop();
@@ -264,17 +534,39 @@ function makeLoraWidget(node, name, value) {
       const left = margin;
       const right = widgetWidth - margin;
       const midY = y + height / 2;
+      // Remembered so hover and the row context menu can find this row from a
+      // node-local Y without re-deriving LiteGraph's widget layout.
+      this.lastY = y;
+      this.lastH = height;
+      const dragging = dragState && dragState.node === node_;
       ctx.save();
+
+      if (dragging && dragState.widget === this && dragState.moved) {
+        ctx.globalAlpha = 0.45;
+      }
 
       ctx.beginPath();
       ctx.roundRect(left, y + 1, right - left, height - 2, 6);
       ctx.fillStyle = this.value.on ? "#2b2b2b" : "#232323";
       ctx.fill();
 
-      let cursor = left + 8;
+      // grip: the drag affordance.  A canvas widget cannot set a cursor for a
+      // region of itself, so the glyph has to carry the whole hint.
+      const gripX = left + 5;
+      ctx.fillStyle = dragging && dragState.widget === this ? "#7fd6a0" : "#5e5e5e";
+      ctx.font = "13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("\u283f", gripX + 5, midY);
+      this.hitAreas.grip = [gripX, gripX + 11];
+
+      let cursor = gripX + 15;
       drawToggle(ctx, cursor, y, height, this.value.on);
       this.hitAreas.toggle = [cursor, cursor + height * 1.7];
       cursor += height * 1.7 + 8;
+      // hovering starts here: the grip and the toggle are controls, not the
+      // LoRA, and popping a preview over them would be noise
+      const previewLeft = cursor;
 
       // the manager's own preview, when the row came from the library
       const image = thumbnail(this.value.previewUrl, node_);
@@ -348,8 +640,28 @@ function makeLoraWidget(node, name, value) {
       }
       ctx.fillText(text, nameLeft, midY);
       this.hitAreas.name = [nameLeft, nameRight];
+      // the span a hover preview answers to: the thumbnail through the name
+      this.hitAreas.preview = [previewLeft, nameRight];
 
       ctx.restore();
+
+      // Drop indicator, drawn after restore so the dragged row's dimming does
+      // not wash it out: a line on the edge of the slot the row would land in.
+      if (dragging && dragState.moved) {
+        const rows = loraWidgets(node_);
+        if (rows[dragState.toIndex] === this) {
+          const downward = dragState.toIndex > dragState.fromIndex;
+          const edge = downward ? y + height - 1 : y + 1;
+          ctx.save();
+          ctx.strokeStyle = "#7fd6a0";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(left, edge);
+          ctx.lineTo(right, edge);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
     },
 
     mouse(event, pos, node_) {
@@ -357,6 +669,10 @@ function makeLoraWidget(node, name, value) {
       const x = pos[0];
       const hit = (area) => area && x >= area[0] && x <= area[1];
 
+      if (hit(this.hitAreas.grip)) {
+        startRowDrag(node_, this, event);
+        return true;
+      }
       if (hit(this.hitAreas.toggle)) {
         this.value = { ...this.value, on: !this.value.on };
         node_.setDirtyCanvas(true, true);
@@ -389,6 +705,7 @@ function makeLoraWidget(node, name, value) {
         return true;
       }
       if (hit(this.hitAreas.name)) {
+        hideTip();
         showLoraMenu(node_, this, event);
         return true;
       }
@@ -420,7 +737,7 @@ function round2(v) {
 
 const PICKER_CSS = `
 .h3lm-picker{position:fixed;z-index:10000;display:flex;flex-direction:column;
-  width:520px;max-width:94vw;background:#1e1e1e;border:1px solid #4a4a4a;
+  width:600px;max-width:94vw;background:#1e1e1e;border:1px solid #4a4a4a;
   border-radius:8px;box-shadow:0 12px 32px rgba(0,0,0,.6);overflow:hidden;
   font-family:system-ui,-apple-system,sans-serif;}
 .h3lm-picker input[type=text]{margin:8px 8px 6px;padding:7px 9px;background:#111;
@@ -429,7 +746,8 @@ const PICKER_CSS = `
 .h3lm-bar{display:flex;align-items:center;gap:8px;padding:0 12px 7px;
   font-size:11px;color:#888;}
 .h3lm-bar select{background:#161616;color:#ccc;border:1px solid #444;
-  border-radius:4px;font-size:11px;padding:2px 4px;max-width:150px;}
+  border-radius:4px;font-size:11px;padding:2px 4px;max-width:170px;
+  min-width:0;flex:0 1 auto;}
 .h3lm-bar label{display:flex;align-items:center;gap:4px;cursor:pointer;
   user-select:none;}
 .h3lm-count{margin-left:auto;white-space:nowrap;}
@@ -459,6 +777,14 @@ const PICKER_CSS = `
 .h3lm-mode{background:none;border:1px solid #444;border-radius:4px;color:#aaa;
   font-size:10.5px;padding:1px 6px;cursor:pointer;font-family:inherit;}
 .h3lm-mode:hover{border-color:#666;color:#ddd;}
+.h3lm-tip{position:fixed;z-index:10001;display:none;opacity:0;
+  transition:opacity .15s ease;pointer-events:none;background:#1a1a1a;
+  border:1px solid #4a4a4a;border-radius:7px;padding:4px;overflow:hidden;
+  box-shadow:0 10px 28px rgba(0,0,0,.65);
+  font-family:system-ui,-apple-system,sans-serif;}
+.h3lm-tip-media{display:block;max-width:280px;max-height:380px;border-radius:4px;}
+.h3lm-tip-name{max-width:280px;padding:4px 3px 1px;font-size:11px;color:#c8c8c8;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 `;
 
 function ensurePickerCss() {
@@ -538,11 +864,13 @@ const SEARCH_DEBOUNCE = 180;
  */
 async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}) {
   ensurePickerCss();
+  hideTip();
 
   const current = widget.value.lora;
   let managerMode = await managerAvailable();
   let localNames = null;          // lazily fetched, only in fallback mode
   let baseModels = null;
+  let folders = null;
 
   const root = document.createElement("div");
   root.className = "h3lm-picker";
@@ -552,6 +880,7 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
   const bar = document.createElement("div");
   bar.className = "h3lm-bar";
   const baseSelect = document.createElement("select");
+  const folderSelect = document.createElement("select");
   const favLabel = document.createElement("label");
   const favBox = document.createElement("input");
   favBox.type = "checkbox";
@@ -591,6 +920,7 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
     document.removeEventListener("pointerdown", onOutside, true);
     clearTimeout(pending);
     inflight?.abort();
+    hideTip();
     root.remove();
     // a row opened straight from "Add LoRA" and then dismissed was never
     // wanted, so take it back out rather than leaving an empty slot behind
@@ -684,8 +1014,18 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
       item.addEventListener("pointerdown", (e) => {
         e.preventDefault();
         e.stopPropagation();
+        hideTip();
         commit(row.patch);
       });
+      if (row.previewUrl) {
+        item.addEventListener("mouseenter", (e) => {
+          scheduleTip(row.previewUrl, row.label ?? row.name, e.clientX, e.clientY);
+        });
+        item.addEventListener("mousemove", (e) => {
+          scheduleTip(row.previewUrl, row.label ?? row.name, e.clientX, e.clientY);
+        });
+        item.addEventListener("mouseleave", hideTip);
+      }
       list.appendChild(item);
     });
     scrollToSel();
@@ -701,6 +1041,7 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
     try {
       data = await managerSearch(input.value.trim(), {
         baseModel: baseSelect.value,
+        folder: folderSelect.value,
         favorites: favBox.checked,
         signal: inflight.signal,
       });
@@ -775,7 +1116,7 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
       ? "Search the LoRA Manager library…"
       : "Type to filter models/loras…  (space-separated terms all must match)";
     bar.replaceChildren();
-    if (managerMode) bar.append(baseSelect, favLabel, count);
+    if (managerMode) bar.append(baseSelect, folderSelect, favLabel, count);
     else bar.append(count);
     modeButton.textContent = managerMode
       ? "source: LoRA Manager"
@@ -795,24 +1136,41 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
     }
     managerMode = !managerMode;
     applyMode();
-    if (managerMode) await fillBaseModels();
+    if (managerMode) await fillFilters();
     render();
     input.focus();
   });
 
-  const fillBaseModels = async () => {
-    if (baseModels !== null) return;
-    baseModels = await managerBaseModels();
-    baseSelect.replaceChildren();
+  /** Fill a select with an "any" row plus `names`, then restore `wanted`. */
+  const fillSelect = (select, anyLabel, names, wanted) => {
+    select.replaceChildren();
     const any = document.createElement("option");
     any.value = "";
-    any.textContent = "any base model";
-    baseSelect.appendChild(any);
-    for (const name of baseModels) {
+    any.textContent = anyLabel;
+    select.appendChild(any);
+    for (const name of names) {
       const option = document.createElement("option");
       option.value = name;
       option.textContent = name;
-      baseSelect.appendChild(option);
+      select.appendChild(option);
+    }
+    // A <select> silently ignores a value with no matching option, so a saved
+    // filter naming something the library no longer has falls back to "any"
+    // rather than looking set while filtering nothing.
+    select.value = wanted || "";
+    return select.value;
+  };
+
+  const fillFilters = async () => {
+    if (baseModels !== null) return;
+    [baseModels, folders] = await Promise.all([managerBaseModels(), managerFolders()]);
+    const saved = readPrefs();
+    const base = fillSelect(baseSelect, "any base model", baseModels, saved.baseModel);
+    const folder = fillSelect(folderSelect, "any folder", folders, saved.folder);
+    favBox.checked = !!saved.favorites;
+    // write back so a filter that no longer resolves stops being re-offered
+    if (base !== (saved.baseModel || "") || folder !== (saved.folder || "")) {
+      writePrefs({ baseModel: base, folder });
     }
   };
 
@@ -834,8 +1192,17 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
   };
 
   input.addEventListener("input", schedule);
-  baseSelect.addEventListener("change", render);
-  favBox.addEventListener("change", render);
+  const rememberAndRender = () => {
+    writePrefs({
+      baseModel: baseSelect.value,
+      folder: folderSelect.value,
+      favorites: favBox.checked,
+    });
+    render();
+  };
+  baseSelect.addEventListener("change", rememberAndRender);
+  folderSelect.addEventListener("change", rememberAndRender);
+  favBox.addEventListener("change", rememberAndRender);
   input.addEventListener("keydown", (e) => {
     if (e.key === "ArrowDown") { e.preventDefault(); move(1); }
     else if (e.key === "ArrowUp") { e.preventDefault(); move(-1); }
@@ -852,7 +1219,7 @@ async function showLoraMenu(node, widget, event, { removeOnCancel = false } = {}
   });
 
   applyMode();
-  if (managerMode) await fillBaseModels();
+  if (managerMode) await fillFilters();
   render();
 
   const grabFocus = () => {
@@ -1080,6 +1447,59 @@ app.registerExtension({
       for (const button of [add, balance, restore]) button.serialize = false;
 
       resize(this);
+    };
+
+    // Canvas widgets get no hover events of their own, so the preview is driven
+    // from the node's own pointer callbacks.  `pos` is node-local, the same
+    // space each row records in draw().
+    const onMouseMove = nodeType.prototype.onMouseMove;
+    nodeType.prototype.onMouseMove = function (event, pos, canvas) {
+      onMouseMove?.apply(this, arguments);
+      if (dragState) return;                  // a drag is not a hover
+      const row = pos ? rowAtNodeY(this, pos[1]) : null;
+      const span = row?.hitAreas?.preview;
+      const over = row && span && pos[0] >= span[0] && pos[0] <= span[1];
+      if (!over || !row.value.previewUrl) return hideTip();
+      scheduleTip(row.value.previewUrl, shortName(row.value.lora),
+                  event.clientX, event.clientY);
+    };
+
+    const onMouseLeave = nodeType.prototype.onMouseLeave;
+    nodeType.prototype.onMouseLeave = function () {
+      onMouseLeave?.apply(this, arguments);
+      hideTip();
+    };
+
+    // Reordering without the mouse-down-and-drag, and the discoverable form of
+    // it: the row is the one under the pointer when the menu was opened.
+    const getExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
+    nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+      getExtraMenuOptions?.apply(this, arguments);
+      const graphMouse = (canvas ?? app.canvas)?.graph_mouse;
+      // Never break the whole context menu over a reorder convenience.
+      if (!graphMouse || !Array.isArray(options)) return;
+      const row = rowAtNodeY(this, graphMouse[1] - this.pos[1]);
+      if (!row) return;
+      const rows = loraWidgets(this);
+      const at = rows.indexOf(row);
+      const label = shortName(row.value.lora);
+      options.push(null, {
+        content: `\u2b06 Move "${label}" up`,
+        disabled: at <= 0,
+        callback: () => moveRow(this, row, at - 1),
+      }, {
+        content: `\u2b07 Move "${label}" down`,
+        disabled: at < 0 || at >= rows.length - 1,
+        callback: () => moveRow(this, row, at + 1),
+      }, {
+        content: "Move to top",
+        disabled: at <= 0,
+        callback: () => moveRow(this, row, 0),
+      }, {
+        content: "Move to bottom",
+        disabled: at < 0 || at >= rows.length - 1,
+        callback: () => moveRow(this, row, rows.length - 1),
+      });
     };
 
     const onConfigure = nodeType.prototype.onConfigure;
