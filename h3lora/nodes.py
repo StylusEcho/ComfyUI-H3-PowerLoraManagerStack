@@ -250,7 +250,6 @@ class H3PowerLoraManagerStack:
 
     @classmethod
     def INPUT_TYPES(cls):
-        modality = {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}
         return {
             "required": {},
             "optional": FlexibleOptionalInputType(ANY, {
@@ -268,21 +267,11 @@ class H3PowerLoraManagerStack:
                                "when the LoRA ships a table. strip: drop mismatched pairs. "
                                "off: leave them.",
                 }),
-                "adaln_video": ("FLOAT", dict(modality, tooltip=(
-                    "Scale every stacked LoRA's adaLN modulation for the video modality "
-                    "(tag 0). All three at 1.0 is a no-op; 0.0 removes that modality's "
-                    "share of every adapter."))),
-                "adaln_text": ("FLOAT", dict(modality, tooltip=(
-                    "Scale every stacked LoRA's adaLN modulation for the "
-                    "text/conditioning modality (tag 1)."))),
-                "adaln_audio": ("FLOAT", dict(modality, tooltip=(
-                    "Scale every stacked LoRA's adaLN modulation for the audio modality "
-                    "(tag 2)."))),
                 "adaln_modality": ("H3_MODALITY", {
                     "tooltip": "Optional. A MiniMax H3 adaLN Modality node -- from the "
                                "original Power LoRA Stack pack -- wired here scales every "
-                               "stacked LoRA's adaLN modulation per modality. It takes "
-                               "precedence over the adaln_video/text/audio widgets above.",
+                               "stacked LoRA's adaLN modulation per modality. Unconnected, "
+                               "adaLN is left at full strength for every modality.",
                 }),
                 "schedule": ("H3_SCHEDULE", {
                     "tooltip": "Optional. An H3 LoRA Schedule chain -- from the original "
@@ -312,7 +301,6 @@ class H3PowerLoraManagerStack:
     DESCRIPTION = __doc__
 
     def apply(self, model=None, quantized_layers="auto", adaln_port="auto",
-              adaln_video=1.0, adaln_text=1.0, adaln_audio=1.0,
               adaln_modality=None, schedule=None, lora_stack=None, **kwargs):
         if model is None:
             raise ValueError("H3 Power LoRA Stack (LoRA Manager): no model connected")
@@ -322,20 +310,10 @@ class H3PowerLoraManagerStack:
         # Upstream stack entries land ahead of this node's rows, matching how a
         # chain of stackers reads on the canvas.
         entries = _collect_lora_stack(lora_stack, issues) + rows
-        widgets = {
-            "video": float(adaln_video),
-            "text": float(adaln_text),
-            "audio": float(adaln_audio),
-        }
-        # One wired node beats three widgets -- but never silently: a setting on
-        # the widgets that the wire discards is called out in the report.
-        modality = widgets if adaln_modality is None else adaln_modality
-        overridden = adaln_modality is not None and any(
-            value != 1.0 for value in widgets.values())
         try:
             patcher, report = apply_mod.apply_stack(
                 model, entries, mode=quantized_layers, adaln_mode=adaln_port,
-                modality=modality, schedule=schedule,
+                modality=adaln_modality, schedule=schedule,
             )
         except Exception as exc:
             LOG.exception("H3 Power LoRA Stack (LoRA Manager) failed; "
@@ -346,9 +324,6 @@ class H3PowerLoraManagerStack:
         text = report.text()
         if not entries and not text.strip():
             text = "no LoRAs enabled"
-        if overridden:
-            text += ("\n  ! adaln_modality is wired, so the node's own "
-                     "adaln_video/text/audio widgets were ignored")
         if issues:
             text = text + ("\n" if text else "") + "\n".join(issues)
             # A row that will not resolve is the one moment the optional

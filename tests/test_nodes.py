@@ -246,23 +246,16 @@ class ApplyTests(unittest.TestCase):
             result = nodes.H3PowerLoraManagerStack().apply(model="MODEL", **kwargs)
         return seen, result
 
-    def test_the_widgets_drive_modality_when_nothing_is_wired(self):
-        seen, _ = self.run_apply(adaln_video=0.5, adaln_text=1.0, adaln_audio=0.25)
-        self.assertEqual(seen["modality"],
-                         {"video": 0.5, "text": 1.0, "audio": 0.25})
+    def test_nothing_wired_means_no_modality_scaling_at_all(self):
+        """The engine reads None as identity; there is no widget fallback."""
+        seen, _ = self.run_apply()
+        self.assertIsNone(seen["modality"])
         self.assertIsNone(seen["schedule"])
 
-    def test_a_wired_modality_node_wins_over_the_widgets(self):
+    def test_a_wired_modality_node_is_passed_straight_through(self):
         wired = {"video": 1.0, "text": 1.0, "audio": 0.0}
-        seen, (_, report, _) = self.run_apply(adaln_video=0.5, adaln_modality=wired)
-        self.assertEqual(seen["modality"], wired)
-        # the discarded widget setting is stated, never dropped quietly
-        self.assertIn("adaln_modality is wired", report)
-
-    def test_untouched_widgets_are_not_reported_as_overridden(self):
-        wired = {"video": 1.0, "text": 1.0, "audio": 0.0}
-        _, (_, report, _) = self.run_apply(adaln_modality=wired)
-        self.assertNotIn("adaln_modality is wired", report)
+        seen, _ = self.run_apply(adaln_modality=wired)
+        self.assertIs(seen["modality"], wired)
 
     def test_a_schedule_chain_is_passed_straight_through(self):
         chain = (schedule.Schedule(rows="all"),)
@@ -311,10 +304,16 @@ class RegistrationTests(unittest.TestCase):
 
     def test_the_inputs_the_frontend_relies_on_are_declared(self):
         optional = nodes.H3PowerLoraManagerStack.INPUT_TYPES()["optional"]
-        for name in ("model", "quantized_layers", "adaln_port", "adaln_video",
-                     "adaln_text", "adaln_audio", "adaln_modality", "schedule",
-                     "lora_stack"):
+        for name in ("model", "quantized_layers", "adaln_port", "adaln_modality",
+                     "schedule", "lora_stack"):
             self.assertIn(name, optional.data)
+
+    def test_modality_is_only_ever_the_wired_node(self):
+        """No adaln_video/text/audio widgets: the Modality node is the one way in."""
+        optional = nodes.H3PowerLoraManagerStack.INPUT_TYPES()["optional"]
+        self.assertEqual(
+            [name for name in optional.data if name.startswith("adaln_")],
+            ["adaln_port", "adaln_modality"])
 
     def test_the_original_packs_node_types_are_accepted_by_name(self):
         """Link types match by string, so the other pack's outputs plug in."""

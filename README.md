@@ -24,8 +24,7 @@ nothing that needed them is lost by there being one node here.
 | `model` | The H3 `MODEL` to patch |
 | `quantized_layers` | `auto` / `branch` / `merge` |
 | `adaln_port` | `auto` / `strip` / `off` |
-| `adaln_video` `adaln_text` `adaln_audio` | Per-modality adaLN scaling; all three at 1.0 is a no-op |
-| `adaln_modality` | Optional `H3_MODALITY`, from **MiniMax H3 adaLN Modality** — wins over the three widgets |
+| `adaln_modality` | Optional `H3_MODALITY`, from **MiniMax H3 adaLN Modality** |
 | `schedule` | Optional `H3_SCHEDULE` chain, from **MiniMax H3 LoRA Schedule** |
 | `lora_stack` | Optional `LORA_STACK`, e.g. from **Lora Stacker (LoraManager)** |
 
@@ -41,11 +40,8 @@ how many.
 
 `adaln_modality` and `schedule` are the outputs of two nodes in the original
 pack. ComfyUI matches links by type name, so installing that pack next to this
-one is all the wiring there is. Leave them unconnected and the node is
-self-contained: the three adaLN widgets cover modality, and rows run at their
-static strength. Wiring `adaln_modality` overrides those widgets — and if they
-were not left at 1.0, the report says so rather than dropping the setting
-quietly.
+one is all the wiring there is. Left unconnected they simply do nothing: adaLN
+runs at full strength for every modality and rows run at their static strength.
 
 ## The LoRA Manager connection
 
@@ -290,12 +286,11 @@ AdaLN does split: `AdalnProj` emits three contiguous blocks of 32256 rows
 (`{video: 0, text: 1, audio: 2}`). Scaling a slice of `lora_B` scales that
 modality's modulation with no runtime hook.
 
-The `adaln_video` / `adaln_text` / `adaln_audio` widgets do that for every
-stacked LoRA at once, and the original pack's **MiniMax H3 adaLN Modality** node
-does the same thing over the `adaln_modality` input — wired, it wins. All three
-at 1.0 is a no-op; 0.0 removes that modality's share. Scaling runs *before*
-AdaLN porting so `.diff_b` inherits it. Geometry is read off the loaded
-`AdalnProj`; `final_layer.adaln_proj` is one-modality and is left alone.
+Wire the original pack's **MiniMax H3 adaLN Modality** node into
+`adaln_modality` and it scales every stacked LoRA at once. All three at 1.0 is a
+no-op; 0.0 removes that modality's share. Scaling runs *before* AdaLN porting so
+`.diff_b` inherits it. Geometry is read off the loaded `AdalnProj`;
+`final_layer.adaln_proj` is one-modality and is left alone.
 
 Where AdaLN is present it is not a marginal knob: 89–99.7% of weight-space
 perturbation for content LoRAs (median ~96%), 16–23% for curve8 turbo
@@ -336,7 +331,8 @@ auto-balance would have used.
 - DoRA, LoHa, LoKr and locon merge in `auto`; `branch` rejects them (only plain
   rank decompositions have the runtime branch path).
 - `adaln_modality` and `schedule` have nothing to connect to unless the original
-  Power LoRA Stack pack is installed; the sockets are simply unused until then.
+  Power LoRA Stack pack is installed, so per-modality adaLN scaling and per-row
+  schedules need that pack; the sockets are simply unused until then.
 
 </details>
 
